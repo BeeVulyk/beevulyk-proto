@@ -1,13 +1,15 @@
 [package]
 name = "beevulyk-proto"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Canonical gRPC contracts for the BeeVulyk platform."
 
 [dependencies]
-prost = "0.13"
-tonic = { version = "0.12", features = ["transport", "codegen", "prost"] }
+prost = "0.14"
+tonic = { version = "0.14", features = ["transport", "codegen"] }
+tonic-prost = "0.14"
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-build = "0.14"
+tonic-prost-build = "0.14"
