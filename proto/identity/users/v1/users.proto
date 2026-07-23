@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package identity.users.v1;
+
+// UsersService owns the identity/users bounded context.
+// This is a gRPC domain service — no HTTP. The public client-gateway
+// is the only caller of RegisterUser in this bootstrap feature.
+service UsersService {
+  // Surface: client
+  // Creates a new user account in unverified state and publishes
+  // UserRegistered to Kafka topic `identity.users.registered`.
+  rpc RegisterUser(RegisterUserRequest) returns (RegisterUserResponse);
+
+  // Surface: internal
+  // Required by platform convention.
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message PingRequest {}
+
+message PingResponse {
+  int64 server_time_ms = 1;
+}
+
+enum UserRole {
+  USER_ROLE_UNSPECIFIED = 0;  // Treated as USER_ROLE_BEEKEEPER at the service.
+  USER_ROLE_BEEKEEPER  = 1;
+  USER_ROLE_AGRI       = 2;
+  USER_ROLE_VET        = 3;
+  USER_ROLE_OTHER      = 4;
+}
+
+message RegisterUserRequest {
+  string   email    = 1;  // required; normalized to lowercase server-side.
+  string   phone    = 2;  // required; E.164 (`^\+[1-9]\d{7,14}$`).
+  string   password = 3;  // required; plaintext over TLS from gateway.
+  UserRole role     = 4;  // optional; UNSPECIFIED -> BEEKEEPER.
+}
+
+message RegisterUserResponse {
+  oneof result {
+    RegisterUserSuccess success = 1;
+    RegisterUserError   error   = 2;
+  }
+}
+
+message RegisterUserSuccess {
+  string   user_id        = 1;  // ULID (26-char Crockford base32).
+  string   email          = 2;
+  string   phone          = 3;
+  UserRole role           = 4;
+  bool     email_verified = 5;  // Always false at creation.
+  bool     phone_verified = 6;  // Always false at creation.
+  int64    created_at_ms  = 7;  // int64 milliseconds since epoch.
+}
+
+enum RegisterUserErrorCode {
+  REGISTER_USER_ERROR_CODE_UNSPECIFIED   = 0;
+  REGISTER_USER_ERROR_CODE_INVALID_INPUT = 1;  // Any validation failure.
+  REGISTER_USER_ERROR_CODE_EMAIL_TAKEN   = 2;  // Unique-constraint violation on email.
+  REGISTER_USER_ERROR_CODE_PHONE_TAKEN   = 3;  // Unique-constraint violation on phone.
+  REGISTER_USER_ERROR_CODE_INTERNAL      = 4;
+}
+
+message FieldError {
+  string field  = 1;  // e.g. "email", "phone", "password", "role".
+  string reason = 2;  // machine-friendly slug, e.g. "invalid_format", "too_short".
+}
+
+message RegisterUserError {
+  RegisterUserErrorCode code    = 1;
+  string                message = 2;  // Human-readable; optional.
+  repeated FieldError   fields  = 3;  // Populated when code = INVALID_INPUT.
+}
