@@ -1,0 +1,172 @@
+syntax = "proto3";
+
+package identity.profiles.v1;
+
+import "google/protobuf/wrappers.proto";
+import "identity/users/v1/users.proto";  // reuse FieldError
+
+// ProfilesService owns the identity/profiles bounded context.
+// gRPC domain service — no HTTP surface (except the SDK-provided
+// `/avatars/{key}` handler mounted by the service itself, which is NOT
+// an RPC and is not described here). client-gateway is the only external
+// caller.
+service ProfilesService {
+  // Surface: client — called by the gateway on behalf of the authenticated user.
+  //   The gateway MUST forward the authenticated user id as the request field
+  //   `user_id` AND as gRPC metadata `x-authenticated-user-id` (see spec §4.4).
+  rpc GetOwnProfile(GetOwnProfileRequest) returns (GetOwnProfileResponse);
+
+  // Surface: client
+  rpc UpdateProfile(UpdateProfileRequest) returns (UpdateProfileResponse);
+
+  // Surface: client
+  rpc UploadAvatar(UploadAvatarRequest) returns (UploadAvatarResponse);
+
+  // Surface: client — public, no gateway auth. `user_id` comes from the path.
+  rpc GetPublicProfile(GetPublicProfileRequest) returns (GetPublicProfileResponse);
+
+  // Surface: internal — required by platform convention.
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message PingRequest {}
+message PingResponse { int64 server_time_ms = 1; }
+
+// Do not redefine FieldError — reuse `identity.users.v1.FieldError`.
+
+enum ProfileSpecialization {
+  PROFILE_SPECIALIZATION_UNSPECIFIED = 0;  // Not set by user yet
+  PROFILE_SPECIALIZATION_BEEKEEPER   = 1;
+  PROFILE_SPECIALIZATION_AGRI        = 2;
+  PROFILE_SPECIALIZATION_VET         = 3;
+  PROFILE_SPECIALIZATION_OTHER       = 4;
+}
+
+// Full — returned by GetOwnProfile / UpdateProfile.
+message Profile {
+  string                user_id            = 1;
+  optional string       display_name       = 2;
+  optional string       location_region    = 3;
+  optional string       location_city      = 4;
+  optional string       bio                = 5;
+  ProfileSpecialization specialization     = 6;
+  optional int32        hive_count         = 7;
+  optional string       avatar_url         = 8;
+  bool                  show_contact_email = 9;
+  bool                  show_contact_phone = 10;
+  int64                 created_at_ms      = 11;
+  int64                 updated_at_ms      = 12;
+}
+
+// Redacted — returned by GetPublicProfile. NB: no visibility flags, no contact values,
+// no updated_at.
+message PublicProfile {
+  string                user_id         = 1;
+  optional string       display_name    = 2;
+  optional string       location_region = 3;
+  optional string       location_city   = 4;
+  optional string       bio             = 5;
+  ProfileSpecialization specialization  = 6;
+  optional int32        hive_count      = 7;
+  optional string       avatar_url      = 8;
+  int64                 created_at_ms   = 9;
+}
+
+// ---- GetOwnProfile ----------------------------------------------------------
+
+message GetOwnProfileRequest { string user_id = 1; }
+message GetOwnProfileResponse {
+  oneof result {
+    GetOwnProfileSuccess success = 1;
+    GetOwnProfileError   error   = 2;
+  }
+}
+message GetOwnProfileSuccess { Profile profile = 1; }
+enum GetOwnProfileErrorCode {
+  GET_OWN_PROFILE_ERROR_CODE_UNSPECIFIED = 0;
+  GET_OWN_PROFILE_ERROR_CODE_NOT_FOUND   = 1;
+  GET_OWN_PROFILE_ERROR_CODE_INTERNAL    = 2;
+}
+message GetOwnProfileError { GetOwnProfileErrorCode code = 1; string message = 2; }
+
+// ---- UpdateProfile ----------------------------------------------------------
+//
+// Tri-state semantics per spec §8.1 (decision (a)):
+//   - Field absent (StringValue not set)             = leave field unchanged.
+//   - Field present with empty string / value = 0    = CLEAR the field (write NULL / 0 as appropriate).
+// Wrapper types (google.protobuf.StringValue, Int32Value, BoolValue) express this
+// unambiguously because presence is checked via `has_*` on the wrapper.
+// For the enum `specialization`, plain proto3 `optional` is sufficient:
+// absent = no change, UNSPECIFIED = do NOT clear (treat as no change),
+// any other = write that value.
+
+message UpdateProfileRequest {
+  string                                user_id            = 1;
+  google.protobuf.StringValue           display_name       = 2;
+  google.protobuf.StringValue           location_region    = 3;
+  google.protobuf.StringValue           location_city      = 4;
+  google.protobuf.StringValue           bio                = 5;
+  optional ProfileSpecialization        specialization     = 6;
+  google.protobuf.Int32Value            hive_count         = 7;
+  google.protobuf.BoolValue             show_contact_email = 8;
+  google.protobuf.BoolValue             show_contact_phone = 9;
+}
+message UpdateProfileResponse {
+  oneof result {
+    UpdateProfileSuccess success = 1;
+    UpdateProfileError   error   = 2;
+  }
+}
+message UpdateProfileSuccess { Profile profile = 1; }  // full updated row
+enum UpdateProfileErrorCode {
+  UPDATE_PROFILE_ERROR_CODE_UNSPECIFIED    = 0;
+  UPDATE_PROFILE_ERROR_CODE_INVALID_INPUT  = 1;
+  UPDATE_PROFILE_ERROR_CODE_NOT_FOUND      = 2;
+  UPDATE_PROFILE_ERROR_CODE_INTERNAL       = 3;
+}
+message UpdateProfileError {
+  UpdateProfileErrorCode                       code    = 1;
+  string                                       message = 2;
+  repeated identity.users.v1.FieldError        fields  = 3;
+}
+
+// ---- UploadAvatar -----------------------------------------------------------
+
+message UploadAvatarRequest {
+  string user_id      = 1;
+  bytes  image        = 2;   // Full file body; gateway enforces the 2 MiB limit BEFORE calling.
+  string content_type = 3;   // MUST be one of: image/png, image/jpeg, image/webp.
+}
+message UploadAvatarResponse {
+  oneof result {
+    UploadAvatarSuccess success = 1;
+    UploadAvatarError   error   = 2;
+  }
+}
+message UploadAvatarSuccess { string avatar_url = 1; }  // absolute URL for immediate use
+enum UploadAvatarErrorCode {
+  UPLOAD_AVATAR_ERROR_CODE_UNSPECIFIED           = 0;
+  UPLOAD_AVATAR_ERROR_CODE_INVALID_CONTENT_TYPE  = 1;
+  UPLOAD_AVATAR_ERROR_CODE_TOO_LARGE             = 2;
+  UPLOAD_AVATAR_ERROR_CODE_NOT_FOUND             = 3;
+  UPLOAD_AVATAR_ERROR_CODE_STORAGE_FAILURE       = 4;
+  UPLOAD_AVATAR_ERROR_CODE_INTERNAL              = 5;
+}
+message UploadAvatarError { UploadAvatarErrorCode code = 1; string message = 2; }
+
+// ---- GetPublicProfile -------------------------------------------------------
+
+message GetPublicProfileRequest { string user_id = 1; }
+message GetPublicProfileResponse {
+  oneof result {
+    GetPublicProfileSuccess success = 1;
+    GetPublicProfileError   error   = 2;
+  }
+}
+message GetPublicProfileSuccess { PublicProfile profile = 1; }
+enum GetPublicProfileErrorCode {
+  GET_PUBLIC_PROFILE_ERROR_CODE_UNSPECIFIED = 0;
+  GET_PUBLIC_PROFILE_ERROR_CODE_NOT_FOUND   = 1;
+  GET_PUBLIC_PROFILE_ERROR_CODE_INTERNAL    = 2;
+}
+message GetPublicProfileError { GetPublicProfileErrorCode code = 1; string message = 2; }
