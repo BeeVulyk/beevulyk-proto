@@ -2,6 +2,14 @@
 //!
 //! One module per proto package, mirroring the `proto/` directory layout.
 
+pub mod beekeeping {
+    pub mod reference {
+        pub mod v1 {
+            tonic::include_proto!("beekeeping.reference.v1");
+        }
+    }
+}
+
 pub mod identity {
     pub mod users {
         pub mod v1 {

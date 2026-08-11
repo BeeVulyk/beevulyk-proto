@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package beekeeping.reference.v1;
+
+// Shared reference dictionaries for the beekeeping domain.
+//
+// These are NOT profile decoration — they are the search filters a buyer
+// will use on marketplace listings. Defined ONCE here and imported by every
+// context that needs them (identity.profiles.v1 today, marketplace listings
+// later). Do NOT redefine these enums in another proto.
+//
+// Closed dictionaries: users pick from these values, they cannot supply
+// free text. Extending means appending a new numbered value here — never
+// renumbering an existing one.
+//
+// This file declares no service. Surface: shared contract.
+
+enum BeeBreed {
+  BEE_BREED_UNSPECIFIED      = 0;
+  BEE_BREED_CARPATHIAN       = 1;
+  BEE_BREED_UKRAINIAN_STEPPE = 2;
+  BEE_BREED_BUCKFAST         = 3;
+  BEE_BREED_ITALIAN          = 4;
+  BEE_BREED_OTHER            = 5;
+}
+
+enum HoneyType {
+  HONEY_TYPE_UNSPECIFIED = 0;
+  HONEY_TYPE_ACACIA      = 1;
+  HONEY_TYPE_LINDEN      = 2;
+  HONEY_TYPE_SUNFLOWER   = 3;
+  HONEY_TYPE_BUCKWHEAT   = 4;
+  HONEY_TYPE_POLYFLORAL  = 5;
+  HONEY_TYPE_RAPESEED    = 6;
+  HONEY_TYPE_OTHER       = 7;
+}
+
+enum ApiaryKind {
+  APIARY_KIND_UNSPECIFIED = 0;
+  APIARY_KIND_MIGRATORY   = 1;
+  APIARY_KIND_STATIONARY  = 2;
+}

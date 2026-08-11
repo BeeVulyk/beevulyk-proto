@@ -4,6 +4,7 @@ package identity.profiles.v1;
 
 import "google/protobuf/wrappers.proto";
 import "identity/users/v1/users.proto";  // reuse FieldError
+import "beekeeping/reference/v1/reference.proto";  // shared dictionaries (see spec §3.1)
 
 // ProfilesService owns the identity/profiles bounded context.
 // gRPC domain service — no HTTP surface (except the SDK-provided
@@ -25,6 +26,36 @@ service ProfilesService {
   // Surface: client — public, no gateway auth. `user_id` comes from the path.
   rpc GetPublicProfile(GetPublicProfileRequest) returns (GetPublicProfileResponse);
 
+  // Surface: client — the gateway MUST forward the authenticated user id as the
+  //   request field `user_id` AND as gRPC metadata `x-authenticated-user-id`.
+  rpc AddApiaryPhoto(AddApiaryPhotoRequest) returns (AddApiaryPhotoResponse);
+
+  // Surface: client — the gateway MUST forward the authenticated user id as the
+  //   request field `user_id` AND as gRPC metadata `x-authenticated-user-id`.
+  rpc DeleteApiaryPhoto(DeleteApiaryPhotoRequest) returns (DeleteApiaryPhotoResponse);
+
+  // Surface: client — the gateway MUST forward the authenticated user id as the
+  //   request field `user_id` AND as gRPC metadata `x-authenticated-user-id`.
+  rpc ReorderApiaryPhotos(ReorderApiaryPhotosRequest) returns (ReorderApiaryPhotosResponse);
+
+  // Surface: client — the gateway MUST forward the authenticated user id as the
+  //   request field `user_id` AND as gRPC metadata `x-authenticated-user-id`.
+  rpc UploadVerificationDocument(UploadVerificationDocumentRequest) returns (UploadVerificationDocumentResponse);
+
+  // Surface: client — OWNER ONLY. Returns the veterinary passport scan bytes
+  //   for the authenticated user's own profile. The scan carries the owner's
+  //   full name and the apiary address, so unlike lab analyses it is never
+  //   served by the public /avatars handler (spec §3.5). Ownership is enforced
+  //   entirely by the metadata contract below — there is no user_id path
+  //   parameter and no way to name another user's document.
+  //   The gateway MUST forward the authenticated user id as the request field
+  //   `user_id` AND as gRPC metadata `x-authenticated-user-id`.
+  rpc GetVerificationDocument(GetVerificationDocumentRequest) returns (GetVerificationDocumentResponse);
+
+  // Surface: client — the gateway MUST forward the authenticated user id as the
+  //   request field `user_id` AND as gRPC metadata `x-authenticated-user-id`.
+  rpc AddLabAnalysis(AddLabAnalysisRequest) returns (AddLabAnalysisResponse);
+
   // Surface: internal — required by platform convention.
   rpc Ping(PingRequest) returns (PingResponse);
 }
@@ -42,6 +73,22 @@ enum ProfileSpecialization {
   PROFILE_SPECIALIZATION_OTHER       = 4;
 }
 
+// Verification lifecycle. Distinct from "a document was uploaded" — a
+// document being submitted and a document being ACCEPTED are different
+// facts (spec §3.2). The buyer-facing badge renders only on VERIFIED, but a
+// PENDING document is still shown to buyers.
+//
+// NOT writable through UpdateProfile. Set to PENDING by the service itself
+// when a document is uploaded, and to VERIFIED / REJECTED only by the manual
+// SQL path until admin-gateway exists.
+enum VerificationStatus {
+  VERIFICATION_STATUS_UNSPECIFIED = 0;  // Never emitted by the service; reserved.
+  VERIFICATION_STATUS_NONE        = 1;  // DB 'none' — nothing submitted.
+  VERIFICATION_STATUS_PENDING     = 2;  // DB 'pending' — submitted, awaiting review.
+  VERIFICATION_STATUS_VERIFIED    = 3;  // DB 'verified'.
+  VERIFICATION_STATUS_REJECTED    = 4;  // DB 'rejected'.
+}
+
 // Full — returned by GetOwnProfile / UpdateProfile.
 message Profile {
   string                user_id            = 1;
@@ -56,10 +103,36 @@ message Profile {
   bool                  show_contact_phone = 10;
   int64                 created_at_ms      = 11;
   int64                 updated_at_ms      = 12;
+
+  optional int32                              started_beekeeping_year    = 13;  // e.g. 2019; client derives the duration
+  repeated beekeeping.reference.v1.BeeBreed   bee_breeds                 = 14;
+  repeated beekeeping.reference.v1.HoneyType  honey_types                = 15;
+  optional beekeeping.reference.v1.ApiaryKind apiary_kind                = 16;
+  bool                                        open_for_visits            = 17;
+  optional string                             vet_passport_number        = 18;
+  // NOT a URL. The passport scan is owner-only (spec §3.5) and is fetched
+  // through client-gateway's GET /me/verification/passport, a fixed path, so
+  // no URL needs to travel on the profile. This flag only tells the owner's
+  // client whether there is a document to fetch.
+  bool                                        has_vet_passport_document  = 19;
+  optional string                             apiary_registration_number = 20;
+  VerificationStatus                          verification_status        = 21;  // read-only
+  optional string                             verified_by                = 22;  // read-only; 'union' | 'admin'
+  optional int64                              verified_at_ms             = 23;  // read-only
+  repeated ApiaryPhoto                        photos                     = 24;  // ordered by position ASC
+  repeated LabAnalysis                        lab_analyses               = 25;  // ordered by analysed_at DESC
 }
 
 // Redacted — returned by GetPublicProfile. NB: no visibility flags, no contact values,
-// no updated_at.
+// no updated_at. The visibility flags (show_contact_email / show_contact_phone)
+// remain absent by design — their state is inferred only from whether
+// contact_email / contact_phone are present. The veterinary passport SCAN is
+// absent by design too: no URL and not even a has-document flag, because
+// verification_status already conveys that a document was submitted (spec §3.5).
+//
+// Numbering deliberately diverges from `Profile` from field 16 onward: `Profile`
+// carries `has_vet_passport_document` at 19 and this message carries no
+// passport-scan field at all. Do not try to keep the two numerically aligned.
 message PublicProfile {
   string                user_id         = 1;
   optional string       display_name    = 2;
@@ -70,7 +143,61 @@ message PublicProfile {
   optional int32        hive_count      = 7;
   optional string       avatar_url      = 8;
   int64                 created_at_ms   = 9;
+
+  optional int32                              started_beekeeping_year    = 10;
+  repeated beekeeping.reference.v1.BeeBreed   bee_breeds                 = 11;
+  repeated beekeeping.reference.v1.HoneyType  honey_types                = 12;
+  optional beekeeping.reference.v1.ApiaryKind apiary_kind                = 13;
+  bool                                        open_for_visits            = 14;
+  // The passport NUMBER is the buyer-facing signal, alongside the badge.
+  // The SCAN is deliberately absent from this message — no URL, and not even
+  // a has-document flag (verification_status already conveys that a document
+  // was submitted). See spec §3.5.
+  optional string                             vet_passport_number        = 15;
+  optional string                             apiary_registration_number = 16;
+  VerificationStatus                          verification_status        = 17;
+  optional string                             verified_by                = 18;
+  optional int64                              verified_at_ms             = 19;
+  repeated ApiaryPhoto                        photos                     = 20;
+  repeated LabAnalysis                        lab_analyses               = 21;  // public by design (spec §3.5)
+  // Populated ONLY when the profile owner set the corresponding visibility
+  // flag AND profile-service could reach users-service. Absent when the flag
+  // is off, and absent (never an error) when users-service is unreachable.
+  // PublicProfile still carries NO show_contact_* flags — their state is
+  // inferred only from whether the value is present.
+  optional string                             contact_email              = 22;
+  optional string                             contact_phone              = 23;
 }
+
+// One image in a seller's apiary gallery. Maximum 10 per user.
+message ApiaryPhoto {
+  string photo_id      = 1;  // ULID.
+  string url           = 2;  // Absolute URL, derived from the stored file key.
+  int32  position      = 3;  // 0-based, contiguous, ascending display order.
+  int64  created_at_ms = 4;
+}
+
+// One honey laboratory analysis. Maximum 5 per user.
+message LabAnalysis {
+  string          analysis_id      = 1;  // ULID.
+  string          url              = 2;  // Absolute URL of the scan/PDF.
+  int64           analysed_at_ms   = 3;  // When the lab performed the analysis.
+  optional double diastase_number  = 4;  // Gothe units. Absent = not reported.
+  optional double moisture_percent = 5;  // 0..100. Absent = not reported.
+  optional bool   has_antibiotics  = 6;  // Absent = not tested / not reported.
+  int64           created_at_ms    = 7;  // When it was uploaded here.
+}
+
+// Presence wrappers for the multi-value dictionary fields on UpdateProfile.
+// proto3 `repeated` has no presence, so a bare repeated field cannot
+// distinguish "leave this list alone" from "replace it with the empty list".
+// Wrapping in a message restores presence and keeps the established
+// tri-state convention intact:
+//   - field absent                    = leave unchanged
+//   - field present, values empty     = CLEAR (write '{}')
+//   - field present, values non-empty = replace wholesale (no partial add/remove)
+message BeeBreedList  { repeated beekeeping.reference.v1.BeeBreed  values = 1; }
+message HoneyTypeList { repeated beekeeping.reference.v1.HoneyType values = 1; }
 
 // ---- GetOwnProfile ----------------------------------------------------------
 
@@ -110,6 +237,46 @@ message UpdateProfileRequest {
   google.protobuf.Int32Value            hive_count         = 7;
   google.protobuf.BoolValue             show_contact_email = 8;
   google.protobuf.BoolValue             show_contact_phone = 9;
+
+  // Tri-state, same convention as fields 2..9:
+  //   Int32Value  : absent = unchanged; present with 0 = CLEAR (write NULL);
+  //                 present with n = set. Same mapper as hive_count — see
+  //                 int32_wrapper_to_update. This is exactly why experience is
+  //                 stored as started_beekeeping_year and not as a duration
+  //                 (spec §3.4): year 0 is not a value anyone can mean, so the
+  //                 clear sentinel is unambiguous, whereas years_experience = 0
+  //                 (a first-season beekeeper) would have been silently
+  //                 swallowed as "not stated".
+  //   StringValue : absent = unchanged; present empty = CLEAR; present = set.
+  //   BoolValue   : absent = unchanged; present = set. open_for_visits is
+  //                 NOT NULL in the DB and therefore has no clear state.
+  //   BeeBreedList / HoneyTypeList (message presence):
+  //                 absent = unchanged; present with values = [] = CLEAR;
+  //                 present with values = wholesale replace. There is no
+  //                 partial add/remove — the client sends the full list.
+  //                 Any UNSPECIFIED member is INVALID_INPUT, not a no-op.
+  //   apiary_kind (proto3 optional enum): absent = unchanged;
+  //                 present with APIARY_KIND_UNSPECIFIED = CLEAR (write NULL);
+  //                 present with a real value = set.
+  //                 *** This is deliberately DIFFERENT from `specialization`
+  //                 (field 6), where UNSPECIFIED means "no change" because
+  //                 profiles.specialization is NOT NULL. profiles.apiary_kind
+  //                 IS nullable, so it needs a clear signal. Do not
+  //                 copy-paste the specialization mapper. ***
+  //
+  // DELIBERATELY ABSENT and MUST NEVER BE ADDED: verification_status,
+  // verified_by, verified_at_ms, has_vet_passport_document / the passport
+  // file key, photos, lab_analyses. A user setting their own verification
+  // flag defeats the entire feature (spec §4.2). Verification status is
+  // written only by the service (on document upload) and by the manual SQL
+  // path.
+  google.protobuf.Int32Value                  started_beekeeping_year    = 10;
+  BeeBreedList                                bee_breeds                 = 11;
+  HoneyTypeList                               honey_types                = 12;
+  optional beekeeping.reference.v1.ApiaryKind apiary_kind                = 13;
+  google.protobuf.BoolValue                   open_for_visits            = 14;
+  google.protobuf.StringValue                 vet_passport_number        = 15;
+  google.protobuf.StringValue                 apiary_registration_number = 16;
 }
 message UpdateProfileResponse {
   oneof result {
@@ -170,3 +337,182 @@ enum GetPublicProfileErrorCode {
   GET_PUBLIC_PROFILE_ERROR_CODE_INTERNAL    = 2;
 }
 message GetPublicProfileError { GetPublicProfileErrorCode code = 1; string message = 2; }
+
+// ---- AddApiaryPhoto ---------------------------------------------------------
+
+message AddApiaryPhotoRequest {
+  string user_id      = 1;
+  bytes  image        = 2;  // Full file body; gateway enforces the 2 MiB cap first.
+  string content_type = 3;  // MUST be image/png, image/jpeg or image/webp.
+}
+message AddApiaryPhotoResponse {
+  oneof result {
+    AddApiaryPhotoSuccess success = 1;
+    AddApiaryPhotoError   error   = 2;
+  }
+}
+message AddApiaryPhotoSuccess {
+  ApiaryPhoto          photo  = 1;  // The newly created photo.
+  repeated ApiaryPhoto photos = 2;  // Full gallery after the insert, position ASC.
+}
+enum AddApiaryPhotoErrorCode {
+  ADD_APIARY_PHOTO_ERROR_CODE_UNSPECIFIED          = 0;
+  ADD_APIARY_PHOTO_ERROR_CODE_INVALID_CONTENT_TYPE = 1;
+  ADD_APIARY_PHOTO_ERROR_CODE_TOO_LARGE            = 2;
+  ADD_APIARY_PHOTO_ERROR_CODE_TOO_MANY_PHOTOS      = 3;  // Cap is 10 per user.
+  ADD_APIARY_PHOTO_ERROR_CODE_NOT_FOUND            = 4;  // No profile row.
+  ADD_APIARY_PHOTO_ERROR_CODE_STORAGE_FAILURE      = 5;
+  ADD_APIARY_PHOTO_ERROR_CODE_INTERNAL             = 6;
+}
+message AddApiaryPhotoError { AddApiaryPhotoErrorCode code = 1; string message = 2; }
+
+// ---- DeleteApiaryPhoto ------------------------------------------------------
+
+message DeleteApiaryPhotoRequest {
+  string user_id  = 1;
+  string photo_id = 2;
+}
+message DeleteApiaryPhotoResponse {
+  oneof result {
+    DeleteApiaryPhotoSuccess success = 1;
+    DeleteApiaryPhotoError   error   = 2;
+  }
+}
+message DeleteApiaryPhotoSuccess {
+  repeated ApiaryPhoto photos = 1;  // Full gallery after the delete, renumbered.
+}
+enum DeleteApiaryPhotoErrorCode {
+  DELETE_APIARY_PHOTO_ERROR_CODE_UNSPECIFIED     = 0;
+  DELETE_APIARY_PHOTO_ERROR_CODE_NOT_FOUND       = 1;  // No profile row.
+  DELETE_APIARY_PHOTO_ERROR_CODE_PHOTO_NOT_FOUND = 2;  // Also covers "belongs to another user".
+  DELETE_APIARY_PHOTO_ERROR_CODE_INTERNAL        = 3;
+}
+message DeleteApiaryPhotoError { DeleteApiaryPhotoErrorCode code = 1; string message = 2; }
+
+// ---- ReorderApiaryPhotos ----------------------------------------------------
+
+message ReorderApiaryPhotosRequest {
+  string          user_id   = 1;
+  repeated string photo_ids = 2;  // MUST be an exact permutation of the user's photo ids.
+}
+message ReorderApiaryPhotosResponse {
+  oneof result {
+    ReorderApiaryPhotosSuccess success = 1;
+    ReorderApiaryPhotosError   error   = 2;
+  }
+}
+message ReorderApiaryPhotosSuccess {
+  repeated ApiaryPhoto photos = 1;  // Gallery in the new order, position 0..n-1.
+}
+enum ReorderApiaryPhotosErrorCode {
+  REORDER_APIARY_PHOTOS_ERROR_CODE_UNSPECIFIED   = 0;
+  REORDER_APIARY_PHOTOS_ERROR_CODE_INVALID_INPUT = 1;  // Not an exact permutation.
+  REORDER_APIARY_PHOTOS_ERROR_CODE_NOT_FOUND     = 2;  // No profile row.
+  REORDER_APIARY_PHOTOS_ERROR_CODE_INTERNAL      = 3;
+}
+message ReorderApiaryPhotosError {
+  ReorderApiaryPhotosErrorCode          code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- UploadVerificationDocument ---------------------------------------------
+// Uploads the veterinary-sanitary passport scan. Moves verification_status
+// none|rejected -> pending. Does NOT move pending or verified.
+
+message UploadVerificationDocumentRequest {
+  string user_id      = 1;
+  bytes  file         = 2;  // Gateway enforces the 5 MiB cap first.
+  string content_type = 3;  // image/png, image/jpeg, image/webp or application/pdf.
+}
+message UploadVerificationDocumentResponse {
+  oneof result {
+    UploadVerificationDocumentSuccess success = 1;
+    UploadVerificationDocumentError   error   = 2;
+  }
+}
+message UploadVerificationDocumentSuccess {
+  // No URL: the scan is owner-only and is fetched via GetVerificationDocument,
+  // not by dereferencing a link (spec §3.5).
+  VerificationStatus verification_status = 1;  // Status AFTER the upload.
+}
+enum UploadVerificationDocumentErrorCode {
+  UPLOAD_VERIFICATION_DOCUMENT_ERROR_CODE_UNSPECIFIED          = 0;
+  UPLOAD_VERIFICATION_DOCUMENT_ERROR_CODE_INVALID_CONTENT_TYPE = 1;
+  UPLOAD_VERIFICATION_DOCUMENT_ERROR_CODE_TOO_LARGE            = 2;
+  UPLOAD_VERIFICATION_DOCUMENT_ERROR_CODE_NOT_FOUND            = 3;
+  UPLOAD_VERIFICATION_DOCUMENT_ERROR_CODE_STORAGE_FAILURE      = 4;
+  UPLOAD_VERIFICATION_DOCUMENT_ERROR_CODE_INTERNAL             = 5;
+}
+message UploadVerificationDocumentError {
+  UploadVerificationDocumentErrorCode code    = 1;
+  string                              message = 2;
+}
+
+// ---- GetVerificationDocument ------------------------------------------------
+// Owner-only read of the veterinary passport scan. There is deliberately no
+// user_id-by-path variant and no public URL — see spec §3.5.
+
+message GetVerificationDocumentRequest {
+  string user_id = 1;  // MUST equal the x-authenticated-user-id metadata.
+}
+message GetVerificationDocumentResponse {
+  oneof result {
+    GetVerificationDocumentSuccess success = 1;
+    GetVerificationDocumentError   error   = 2;
+  }
+}
+message GetVerificationDocumentSuccess {
+  bytes  file         = 1;  // Full file body.
+  string content_type = 2;  // image/png, image/jpeg, image/webp or application/pdf.
+}
+enum GetVerificationDocumentErrorCode {
+  GET_VERIFICATION_DOCUMENT_ERROR_CODE_UNSPECIFIED        = 0;
+  GET_VERIFICATION_DOCUMENT_ERROR_CODE_NOT_FOUND          = 1;  // No profile row.
+  GET_VERIFICATION_DOCUMENT_ERROR_CODE_DOCUMENT_NOT_FOUND = 2;  // Profile exists, no passport uploaded.
+  GET_VERIFICATION_DOCUMENT_ERROR_CODE_STORAGE_FAILURE    = 3;  // Key recorded but the object is unreadable.
+  GET_VERIFICATION_DOCUMENT_ERROR_CODE_INTERNAL           = 4;
+}
+message GetVerificationDocumentError {
+  GetVerificationDocumentErrorCode code    = 1;
+  string                           message = 2;
+}
+
+// ---- AddLabAnalysis ---------------------------------------------------------
+// Also moves verification_status none|rejected -> pending.
+
+message AddLabAnalysisRequest {
+  string                      user_id          = 1;
+  bytes                       file             = 2;  // Gateway enforces 5 MiB first.
+  string                      content_type     = 3;  // png/jpeg/webp/pdf.
+  int64                       analysed_at_ms   = 4;  // Required, > 0, not in the future.
+  google.protobuf.DoubleValue diastase_number  = 5;  // Optional; 0..100 when present.
+  google.protobuf.DoubleValue moisture_percent = 6;  // Optional; 0..100 when present.
+  google.protobuf.BoolValue   has_antibiotics  = 7;  // Optional.
+}
+message AddLabAnalysisResponse {
+  oneof result {
+    AddLabAnalysisSuccess success = 1;
+    AddLabAnalysisError   error   = 2;
+  }
+}
+message AddLabAnalysisSuccess {
+  LabAnalysis          analysis            = 1;
+  repeated LabAnalysis analyses            = 2;  // All analyses after insert, analysed_at DESC.
+  VerificationStatus   verification_status = 3;
+}
+enum AddLabAnalysisErrorCode {
+  ADD_LAB_ANALYSIS_ERROR_CODE_UNSPECIFIED          = 0;
+  ADD_LAB_ANALYSIS_ERROR_CODE_INVALID_CONTENT_TYPE = 1;
+  ADD_LAB_ANALYSIS_ERROR_CODE_TOO_LARGE            = 2;
+  ADD_LAB_ANALYSIS_ERROR_CODE_INVALID_INPUT        = 3;  // Bad analysed_at / indicator out of range.
+  ADD_LAB_ANALYSIS_ERROR_CODE_TOO_MANY_ANALYSES    = 4;  // Cap is 5 per user.
+  ADD_LAB_ANALYSIS_ERROR_CODE_NOT_FOUND            = 5;
+  ADD_LAB_ANALYSIS_ERROR_CODE_STORAGE_FAILURE      = 6;
+  ADD_LAB_ANALYSIS_ERROR_CODE_INTERNAL             = 7;
+}
+message AddLabAnalysisError {
+  AddLabAnalysisErrorCode               code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}

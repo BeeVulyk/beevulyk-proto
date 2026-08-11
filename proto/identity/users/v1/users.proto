@@ -32,6 +32,19 @@ service UsersService {
   // Revokes the given refresh token. Idempotent — returns Success even if the
   // token was unknown or already revoked, to avoid leaking existence.
   rpc Logout(LogoutRequest) returns (LogoutResponse);
+
+  // Surface: internal
+  // Resolves a user's contact values by user id. Called ONLY by
+  // profile-service, to populate PublicProfile.contact_email /
+  // contact_phone when the profile owner has switched the corresponding
+  // visibility flag on. MUST NOT be exposed through client-gateway or any
+  // future admin-gateway: it is an existence oracle for user ids and
+  // returns PII unconditionally — the authorization decision (the
+  // show_contact_* flags) lives in profile-service, not here.
+  //
+  // Single-id by design. A batch variant is a clean additive follow-up if
+  // marketplace listings ever need to resolve N sellers at once.
+  rpc GetUserContacts(GetUserContactsRequest) returns (GetUserContactsResponse);
 }
 
 message PingRequest {}
@@ -182,4 +195,37 @@ enum LogoutErrorCode {
 message LogoutError {
   LogoutErrorCode code    = 1;
   string          message = 2;
+}
+
+// ---- GetUserContacts --------------------------------------------------------
+
+message GetUserContactsRequest {
+  string user_id = 1;  // ULID (26-char Crockford base32).
+}
+
+message GetUserContactsResponse {
+  oneof result {
+    GetUserContactsSuccess success = 1;
+    GetUserContactsError   error   = 2;
+  }
+}
+
+message GetUserContactsSuccess {
+  string user_id = 1;
+  string email   = 2;  // Always populated — users.email is NOT NULL.
+  string phone   = 3;  // Always populated — users.phone is NOT NULL, E.164.
+}
+
+// First NOT_FOUND variant in identity.users.v1 — expected and correct, this is
+// the package's first lookup-shaped RPC.
+enum GetUserContactsErrorCode {
+  GET_USER_CONTACTS_ERROR_CODE_UNSPECIFIED   = 0;
+  GET_USER_CONTACTS_ERROR_CODE_INVALID_INPUT = 1;  // user_id empty or not a ULID.
+  GET_USER_CONTACTS_ERROR_CODE_NOT_FOUND     = 2;  // No such user.
+  GET_USER_CONTACTS_ERROR_CODE_INTERNAL      = 3;
+}
+
+message GetUserContactsError {
+  GetUserContactsErrorCode code    = 1;
+  string                   message = 2;
 }
