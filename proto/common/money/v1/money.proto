@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package common.money.v1;
+
+// Monetary units shared by every domain.
+//
+// This package belongs to no domain: marketplace listings price goods in it today,
+// orders will snapshot it, and any future payment surface will use the same values.
+// Per the package-naming convention it is therefore `common.*`, not
+// `<domain>.reference.*`.
+//
+// Closed dictionary: extending means APPENDING a new numbered value — never
+// renumbering or reusing an existing one.
+//
+// This file declares no service. Surface: shared contract.
+
+// ISO 4217 alphabetic codes. Only UAH is legal platform-wide today; the enum
+// exists so that adding a second currency is an append rather than a wire change
+// on every message that carries an amount.
+//
+// Deliberately NOT accompanied by a `Money` message. Amounts and their currency
+// travel as two sibling fields on the owning message (e.g. Listing.price_amount +
+// Listing.price_currency), which keeps the HTTP JSON flat and matches the two
+// separate SQL columns. Introducing `Money{amount,currency}` later would be a wire
+// break on every carrier, so do not add one speculatively.
+enum Currency {
+  CURRENCY_UNSPECIFIED = 0;  // Never a stored value. On a request it means "default", which is UAH.
+  CURRENCY_UAH         = 1;  // Hryvnia. Amounts are ALWAYS integer minor units (kopiyky).
+}

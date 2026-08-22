@@ -16,6 +16,11 @@ pub mod common {
             tonic::include_proto!("common.geo.v1");
         }
     }
+    pub mod money {
+        pub mod v1 {
+            tonic::include_proto!("common.money.v1");
+        }
+    }
 }
 
 pub mod identity {
@@ -27,6 +32,19 @@ pub mod identity {
     pub mod profiles {
         pub mod v1 {
             tonic::include_proto!("identity.profiles.v1");
+        }
+    }
+}
+
+pub mod marketplace {
+    pub mod reference {
+        pub mod v1 {
+            tonic::include_proto!("marketplace.reference.v1");
+        }
+    }
+    pub mod listings {
+        pub mod v1 {
+            tonic::include_proto!("marketplace.listings.v1");
         }
     }
 }

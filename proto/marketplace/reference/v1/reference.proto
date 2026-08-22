@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package marketplace.reference.v1;
+
+// Shared reference dictionaries for the marketplace domain.
+//
+// A new package rather than an addition to `beekeeping.reference.v1`: product
+// categories, quantity units and delivery methods are not beekeeping concepts —
+// AGRI_GOODS and EQUIPMENT are already outside that domain, and the beekeeping
+// file's own header scopes it to beekeeping.
+//
+// Do NOT define here: Oblast (common.geo.v1), BeeBreed / HoneyType / ApiaryKind
+// (beekeeping.reference.v1), Currency (common.money.v1). Import them.
+//
+// Closed dictionaries: users pick from these values, they cannot supply free text.
+// Extending means appending a new numbered value here — never renumbering.
+//
+// This file declares no service. Surface: shared contract.
+
+// The horizontal catalogue. Present in full from day one because the catalogue is
+// horizontal by decision (architecture §1) — AGRI_GOODS is here because the data
+// model must accept it without a migration, not because it is part of the wedge.
+enum ProductCategory {
+  PRODUCT_CATEGORY_UNSPECIFIED     = 0;
+  PRODUCT_CATEGORY_QUEEN_BEE       = 1;  // матка
+  PRODUCT_CATEGORY_BEE_PACKAGE     = 2;  // бджолопакет
+  PRODUCT_CATEGORY_BEE_COLONY      = 3;  // бджолосім'я
+  PRODUCT_CATEGORY_HONEY           = 4;
+  PRODUCT_CATEGORY_BEE_PRODUCT     = 5;  // propolis, pollen, wax, royal jelly
+  PRODUCT_CATEGORY_HIVE            = 6;
+  PRODUCT_CATEGORY_EQUIPMENT       = 7;
+  PRODUCT_CATEGORY_VET_PREPARATION = 8;  // regulated — see the eligibility gate
+  PRODUCT_CATEGORY_AGRI_GOODS      = 9;
+}
+
+enum QuantityUnit {
+  QUANTITY_UNIT_UNSPECIFIED = 0;
+  QUANTITY_UNIT_PIECE       = 1;
+  QUANTITY_UNIT_KILOGRAM    = 2;
+  QUANTITY_UNIT_LITRE       = 3;
+  QUANTITY_UNIT_SET         = 4;
+}
+
+// Delivery capability is a property of the PRODUCT, not a checkout choice
+// (spec §3.6). Nova Poshta prohibits sending insects outright and Ukrposhta
+// dropped bee packages in 2021, so bee packages have no compliant carrier.
+//
+// NOVA_POSHTA IS DELIBERATELY ABSENT AND MUST NOT BE ADDED for live goods.
+// Shipping bees by Nova Poshta breaks the carrier's own rules, voids any recourse
+// against them, and produces disputes the platform has decided not to arbitrate
+// (TASK-66/67). If it is ever added for inert goods, it must be gated by category.
+enum DeliveryMethod {
+  DELIVERY_METHOD_UNSPECIFIED    = 0;
+  DELIVERY_METHOD_UKRPOSHTA      = 1;
+  DELIVERY_METHOD_SELF_PICKUP    = 2;
+  DELIVERY_METHOD_COURIER_AGREED = 3;  // private transport arranged between the parties
+}
+
+// A queen is not stock, it is a booking (spec §1). PRE_ORDER pairs with
+// Listing.readiness_date, and the pairing is an invariant in both directions.
+enum AvailabilityMode {
+  AVAILABILITY_MODE_UNSPECIFIED = 0;
+  AVAILABILITY_MODE_IN_STOCK    = 1;
+  AVAILABILITY_MODE_PRE_ORDER   = 2;
+}

@@ -1,0 +1,775 @@
+syntax = "proto3";
+
+package marketplace.listings.v1;
+
+import "google/protobuf/wrappers.proto";
+// NOTE ON `identity/users/v1/users.proto`: this is a service package importing another
+// domain's service package, which the repo README otherwise forbids. It is imported
+// for exactly one type — `FieldError` — which `identity.profiles.v1` already reuses the
+// same way. The alternatives are worse: redefining FieldError duplicates a type across
+// packages (explicitly forbidden), and hoisting it into `common.errors.v1` would
+// renumber it out of two shipped packages, i.e. a breaking change to contracts that are
+// already pinned by three services. Recorded as accepted debt; the hoist belongs in a
+// dedicated breaking release, not here. Import NOTHING ELSE from identity.*.
+import "identity/users/v1/users.proto";              // reuse FieldError — see the note above
+import "beekeeping/reference/v1/reference.proto";    // BeeBreed, HoneyType — reuse, never redefine
+import "common/geo/v1/geo.proto";                    // Oblast — the single geographic dictionary
+import "common/money/v1/money.proto";                // Currency
+import "marketplace/reference/v1/reference.proto";   // ProductCategory, QuantityUnit, DeliveryMethod, AvailabilityMode
+
+// ListingsService owns the marketplace/listings bounded context: catalogue
+// documents, their lifecycle, and their photos.
+//
+// gRPC domain service — no HTTP surface except the SDK-mounted public
+// `/listing-photos/{key}` static handler, which is NOT an RPC and is not described
+// here. client-gateway is the only external caller. orders-service (#47) is the
+// only internal caller, of GetListingForOrder alone.
+service ListingsService {
+  // Surface: client — called by the gateway on behalf of the authenticated seller.
+  //   The gateway MUST forward the authenticated user id as the request field
+  //   `seller_id` AND as gRPC metadata `x-authenticated-user-id`.
+  //   Always lands in DRAFT. Field-level validation is full even for a draft; the
+  //   whole-listing completeness rules belong to PublishListing.
+  rpc CreateListing(CreateListingRequest) returns (CreateListingResponse);
+
+  // Surface: client — `seller_id` in the field AND in `x-authenticated-user-id`.
+  //   Tri-state. Deliberately CANNOT touch `quantity_available` (see SetQuantity),
+  //   `status` (see the lifecycle RPCs), `category` or `price_currency`.
+  rpc UpdateListing(UpdateListingRequest) returns (UpdateListingResponse);
+
+  // Surface: client — `seller_id` in the field AND in `x-authenticated-user-id`.
+  //   Exists SOLELY so that quantity never travels the generic tri-state path.
+  //   `quantity` present with value 0 means ZERO ("none left, listing still up"),
+  //   which is a meaningful state; under the platform's Int32Value convention 0
+  //   means CLEAR. The two zero-semantics must never share a request message
+  //   (spec §3.7).
+  rpc SetQuantity(SetQuantityRequest) returns (SetQuantityResponse);
+
+  // Surface: client — `seller_id` in the field AND in `x-authenticated-user-id`.
+  //   DRAFT|PAUSED -> ACTIVE. The ONLY place a listing is validated as a whole
+  //   (spec §4.5). Publishes ListingPublished to Kafka topic
+  //   `marketplace.listings.published` AFTER the DB commit, best-effort.
+  rpc PublishListing(PublishListingRequest) returns (PublishListingResponse);
+
+  // Surface: client — `seller_id` in the field AND in `x-authenticated-user-id`.
+  //   ACTIVE -> PAUSED.
+  rpc PauseListing(PauseListingRequest) returns (PauseListingResponse);
+
+  // Surface: client — `seller_id` in the field AND in `x-authenticated-user-id`.
+  //   PAUSED -> ACTIVE. Runs the SAME publish gate as PublishListing: a listing can
+  //   lose its last photo or outlive its readiness date while paused, and resuming
+  //   into an invalid state is exactly what the gate exists to stop. The only
+  //   difference from PublishListing is the accepted source status.
+  rpc ResumeListing(ResumeListingRequest) returns (ResumeListingResponse);
+
+  // Surface: client — `seller_id` in the field AND in `x-authenticated-user-id`.
+  //   DRAFT|ACTIVE|PAUSED -> CLOSED. Terminal by seller action.
+  rpc CloseListing(CloseListingRequest) returns (CloseListingResponse);
+
+  // Surface: client — `seller_id` in the field AND in `x-authenticated-user-id`.
+  //   Owner-scoped; returns every status including DRAFT and BLOCKED.
+  rpc GetOwnListing(GetOwnListingRequest) returns (GetOwnListingResponse);
+
+  // Surface: client — `seller_id` in the field AND in `x-authenticated-user-id`.
+  //   Owner-scoped. Simple offset pagination; buyer-facing search is #46 and is
+  //   deliberately not this RPC.
+  rpc ListOwnListings(ListOwnListingsRequest) returns (ListOwnListingsResponse);
+
+  // Surface: client — `seller_id` in the field AND in `x-authenticated-user-id`.
+  rpc AddListingPhoto(AddListingPhotoRequest) returns (AddListingPhotoResponse);
+
+  // Surface: client — `seller_id` in the field AND in `x-authenticated-user-id`.
+  rpc DeleteListingPhoto(DeleteListingPhotoRequest) returns (DeleteListingPhotoResponse);
+
+  // Surface: client — `seller_id` in the field AND in `x-authenticated-user-id`.
+  rpc ReorderListingPhotos(ReorderListingPhotosRequest) returns (ReorderListingPhotosResponse);
+
+  // Surface: client — PUBLIC, no gateway auth, no metadata. `listing_id` comes from
+  //   the path. Serves ACTIVE and PAUSED only; every other status is NOT_FOUND, so
+  //   that a blocked listing's existence is not leaked.
+  //   Carries the seller trust block, which DEGRADES: if profile-service is
+  //   unreachable the listing is returned with `seller_trust` absent rather than
+  //   failing. A missing badge must not take down a catalogue page (spec §3.10).
+  rpc GetPublicListing(GetPublicListingRequest) returns (GetPublicListingResponse);
+
+  // Surface: internal — for orders-service (#47). Returns everything an order
+  //   snapshot needs. MUST NOT be exposed through client-gateway or any future
+  //   admin-gateway. No caller exists yet.
+  //   This RPC MUST NOT DEGRADE, deliberately unlike GetPublicListing: an order
+  //   created from a guessed price is a contract for the wrong amount. The instinct
+  //   after GetPublicListing will be to degrade everywhere — do not.
+  rpc GetListingForOrder(GetListingForOrderRequest) returns (GetListingForOrderResponse);
+
+  // Surface: internal — required by platform convention.
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message PingRequest {}
+message PingResponse { int64 server_time_ms = 1; }
+
+// Do not redefine FieldError — reuse `identity.users.v1.FieldError`.
+
+// ---- Enums local to this package --------------------------------------------
+//
+// `ListingStatus` and `ItemCondition` live here, not in `marketplace.reference.v1`:
+// a status is the listings aggregate's own lifecycle, and neither is a dictionary
+// shared across the marketplace domain. Do not move them.
+
+// Listing lifecycle. Legal transitions:
+//   DRAFT   -> ACTIVE (PublishListing) | CLOSED (CloseListing)
+//   ACTIVE  -> PAUSED (PauseListing)   | CLOSED | ARCHIVED (background sweeper)
+//   PAUSED  -> ACTIVE (ResumeListing or PublishListing) | CLOSED
+//   CLOSED / ARCHIVED are terminal for every seller action.
+//   BLOCKED is reachable ONLY by manual SQL — there is no moderation RPC and no
+//   admin-gateway. Do not add one.
+enum ListingStatus {
+  LISTING_STATUS_UNSPECIFIED = 0;  // Never emitted by the service.
+  LISTING_STATUS_DRAFT       = 1;
+  LISTING_STATUS_ACTIVE      = 2;
+  LISTING_STATUS_PAUSED      = 3;
+  LISTING_STATUS_CLOSED      = 4;
+  LISTING_STATUS_ARCHIVED    = 5;
+  LISTING_STATUS_BLOCKED     = 6;
+}
+
+enum ItemCondition {
+  ITEM_CONDITION_UNSPECIFIED = 0;
+  ITEM_CONDITION_NEW         = 1;
+  ITEM_CONDITION_USED        = 2;
+}
+
+// Mirrors identity.profiles.v1.VerificationStatus VALUE FOR VALUE, deliberately as a
+// SEPARATE type. marketplace.listings.v1 must not import identity.profiles.v1: the
+// trust block is a marketplace presentation concern, and coupling this wire format to
+// the identity profile's evolution is exactly what the package-import rule forbids.
+// listings-service maps between the two 1:1. Keep the numbers aligned so the mapping
+// stays a one-liner, but do NOT replace this with an import.
+enum SellerVerificationStatus {
+  SELLER_VERIFICATION_STATUS_UNSPECIFIED = 0;
+  SELLER_VERIFICATION_STATUS_NONE        = 1;
+  SELLER_VERIFICATION_STATUS_PENDING     = 2;
+  SELLER_VERIFICATION_STATUS_VERIFIED    = 3;
+  SELLER_VERIFICATION_STATUS_REJECTED    = 4;
+}
+
+// ---- Presence wrappers ------------------------------------------------------
+//
+// proto3 `repeated` has no presence, and `google.protobuf.BoolValue` /
+// `Int32Value` cannot express "clear" for a nullable column whose zero value is
+// legitimate. Both gaps are closed the same way `identity.profiles.v1.BeeBreedList`
+// closes its own — message presence means "touch this field".
+
+// absent = leave unchanged; present with values = [] = CLEAR (write '{}');
+// present with values = replace wholesale. There is no partial add/remove.
+// Any UNSPECIFIED member is INVALID_INPUT, never a no-op.
+message DeliveryMethodList { repeated marketplace.reference.v1.DeliveryMethod values = 1; }
+
+// Tri-state for a NULLABLE scalar. Message absent = leave unchanged; message present
+// with `value` absent = CLEAR (write NULL); message present with `value` = set.
+//
+// Used INSTEAD OF google.protobuf.BoolValue / Int32Value on this package's nullable
+// promoted attributes. Under the platform convention Int32Value{0} means CLEAR, which
+// is safe for a birth year but is a trap the moment a zero is meaningful — and
+// `frame_count`/`queen_year_bred`/`harvest_year` sit in the same message as fields
+// where it would be. One uniform mapper per nullability class beats four fields that
+// each need the reader to ask "is zero meaningful here?".
+message BoolUpdate  { optional bool  value = 1; }
+message Int32Update { optional int32 value = 1; }
+
+// ---- Domain messages --------------------------------------------------------
+//
+// `readiness_date` is a `string` in `YYYY-MM-DD`, NOT an int64 millisecond
+// timestamp. Do not "fix" it: the platform rule that timestamps are int64 ms
+// governs *instants*. A readiness date is a calendar date; an epoch-millisecond
+// encoding forces a timezone choice, and "ready 15 May" becomes 14 May for every
+// reader east of UTC. The same reasoning already made
+// `identity.profiles.v1.started_beekeeping_year` a plain int32 year rather than a
+// timestamp. The column is `DATE`, the JSON key is `readiness_date`, the value is
+// the same `YYYY-MM-DD` string end to end.
+//
+// `attributes_json` is a `string` carrying a JSON **object** (`{}` when empty), not
+// `google.protobuf.Struct`. `build.rs` does not compile well-known types, so
+// `Struct` would drag in `prost-types` and a `Value` tree that is far more awkward
+// to validate than `serde_json::from_str` against a per-category typed Rust struct —
+// which is what spec §3.2 requires anyway. The gateway splices/parses it as a real
+// JSON object at the HTTP boundary.
+
+// One image in a listing gallery. Maximum 8 per listing.
+message ListingPhoto {
+  string photo_id      = 1;  // ULID.
+  string url           = 2;  // Absolute URL, derived at read time from the stored file key.
+  int32  position      = 3;  // 0-based, contiguous, ascending display order.
+  int64  created_at_ms = 4;
+}
+
+// One honey laboratory analysis as shown on a listing. Structurally a subset of
+// identity.profiles.v1.LabAnalysis, redeclared here for the same reason
+// SellerVerificationStatus is — no identity.profiles.v1 import.
+message SellerLabAnalysis {
+  string          analysis_id      = 1;
+  string          url              = 2;
+  int64           analysed_at_ms   = 3;
+  optional double diastase_number  = 4;
+  optional double moisture_percent = 5;
+  optional bool   has_antibiotics  = 6;
+}
+
+// Seller trust signals rendered beside a public listing (spec §3.10). Fetched from
+// profile-service.GetPublicProfile at read time and NEVER stored in listings_service.
+//
+// `has_vet_passport_number` is a PRESENCE FLAG, not the number: the spec scopes the
+// listing surface to "passport-number presence". The number itself stays on the
+// profile page.
+message SellerTrustBlock {
+  string                     seller_id                  = 1;
+  optional string            display_name               = 2;
+  optional string            avatar_url                 = 3;
+  SellerVerificationStatus   verification_status        = 4;
+  bool                       has_vet_passport_number    = 5;
+  optional string            apiary_registration_number = 6;
+  repeated SellerLabAnalysis lab_analyses               = 7;  // analysed_at DESC
+}
+
+// Full owner-facing view — returned by CreateListing, UpdateListing, SetQuantity and
+// every lifecycle RPC, and by GetOwnListing.
+message Listing {
+  string                                          listing_id         = 1;   // ULID
+  string                                          seller_id          = 2;   // ULID, soft ref to users_service.users
+  marketplace.reference.v1.ProductCategory        category           = 3;   // immutable after creation
+  ListingStatus                                   status             = 4;
+  string                                          title              = 5;   // 3..140 chars
+  optional string                                 description        = 6;   // <= 4000 chars
+
+  int64                                           price_amount       = 7;   // INTEGER MINOR UNITS (kopiyky). Never a float, never a bare number.
+  common.money.v1.Currency                        price_currency     = 8;   // CURRENCY_UAH today; single legal value
+  marketplace.reference.v1.QuantityUnit           quantity_unit      = 9;
+  // Soft counter, eventually consistent (spec §3.7). Absent = not tracked.
+  // Present with 0 = none left, listing still up. `sold_out` is NOT a status — it is
+  // derived at read time from this field. Do not store one.
+  optional int32                                  quantity_available = 10;
+
+  marketplace.reference.v1.AvailabilityMode       availability_mode  = 11;
+  // `YYYY-MM-DD`. Present exactly when availability_mode = PRE_ORDER — the invariant
+  // holds in BOTH directions and is enforced by a table CHECK and, before it, by a
+  // typed FieldError in the use case.
+  optional string                                 readiness_date     = 12;
+  repeated marketplace.reference.v1.DeliveryMethod delivery_methods  = 13;  // non-empty once ACTIVE
+
+  optional common.geo.v1.Oblast                   location_region    = 14;
+  optional string                                 location_city      = 15;  // free text, <= 200 chars
+
+  // Promoted attributes: filtered or sorted on in search (#46) or read by the order
+  // machine (#47/#48), therefore real columns. Everything else lives in attributes_json.
+  optional beekeeping.reference.v1.BeeBreed       bee_breed          = 16;  // SINGULAR here; plural on a profile (spec §3.4)
+  optional beekeeping.reference.v1.HoneyType      honey_type         = 17;
+  optional bool                                   queen_mated        = 18;
+  optional int32                                  queen_year_bred    = 19;
+  optional int32                                  frame_count        = 20;
+  optional int32                                  harvest_year       = 21;
+  optional ItemCondition                          item_condition     = 22;
+
+  // JSON object, `{}` when empty. Validated in the domain layer against a
+  // per-category typed Rust struct with deny_unknown_fields — never free-form.
+  // A malformed attribute set is INVALID_INPUT with FieldErrors, never a 500.
+  string                                          attributes_json    = 23;
+  repeated ListingPhoto                           photos             = 24;  // position ASC
+
+  optional int64                                  published_at_ms    = 25;
+  int64                                           created_at_ms      = 26;
+  int64                                           updated_at_ms      = 27;
+}
+
+// Buyer-facing view — returned by GetPublicListing. Field numbers track `Listing`
+// through 26 because the projection happens to be a strict subset plus one addition;
+// they diverge at 27 and MUST NOT be forced back into alignment if either message
+// grows. `updated_at_ms` is absent by design (an edit is not a buyer-facing event).
+message PublicListing {
+  string                                          listing_id         = 1;
+  string                                          seller_id          = 2;
+  marketplace.reference.v1.ProductCategory        category           = 3;
+  ListingStatus                                   status             = 4;   // ACTIVE or PAUSED only
+  string                                          title              = 5;
+  optional string                                 description        = 6;
+
+  int64                                           price_amount       = 7;
+  common.money.v1.Currency                        price_currency     = 8;
+  marketplace.reference.v1.QuantityUnit           quantity_unit      = 9;
+  optional int32                                  quantity_available = 10;
+
+  marketplace.reference.v1.AvailabilityMode       availability_mode  = 11;
+  optional string                                 readiness_date     = 12;
+  repeated marketplace.reference.v1.DeliveryMethod delivery_methods  = 13;
+
+  optional common.geo.v1.Oblast                   location_region    = 14;
+  optional string                                 location_city      = 15;
+
+  optional beekeeping.reference.v1.BeeBreed       bee_breed          = 16;
+  optional beekeeping.reference.v1.HoneyType      honey_type         = 17;
+  optional bool                                   queen_mated        = 18;
+  optional int32                                  queen_year_bred    = 19;
+  optional int32                                  frame_count        = 20;
+  optional int32                                  harvest_year       = 21;
+  optional ItemCondition                          item_condition     = 22;
+
+  string                                          attributes_json    = 23;
+  repeated ListingPhoto                           photos             = 24;
+
+  int64                                           published_at_ms    = 25;  // not optional — a public listing has been published
+  int64                                           created_at_ms      = 26;
+
+  // Absent when profile-service was unreachable or returned an error. That is the
+  // degrade policy (spec §3.10), not an error path: the RPC still returns Success.
+  optional SellerTrustBlock                       seller_trust       = 27;
+}
+
+// Light projection for ListOwnListings. A seller's list screen needs a thumbnail and
+// a price, not the attribute tail — sending full Listings would ship the JSONB blob
+// and every photo row for a 50-item page.
+message ListingSummary {
+  string                                    listing_id         = 1;
+  marketplace.reference.v1.ProductCategory  category           = 2;
+  ListingStatus                             status             = 3;
+  string                                    title              = 4;
+  int64                                     price_amount       = 5;
+  common.money.v1.Currency                  price_currency     = 6;
+  marketplace.reference.v1.QuantityUnit     quantity_unit      = 7;
+  optional int32                            quantity_available = 8;
+  marketplace.reference.v1.AvailabilityMode availability_mode  = 9;
+  optional string                           readiness_date     = 10;
+  optional common.geo.v1.Oblast             location_region    = 11;
+  optional string                           primary_photo_url  = 12;  // the photo at position 0, if any
+  optional int64                            published_at_ms    = 13;
+  int64                                     created_at_ms      = 14;
+  int64                                     updated_at_ms      = 15;
+}
+
+// Everything orders-service (#47) must snapshot at order creation. The order copies
+// these values and never reads the listing again — a dispute is adjudicated against
+// what was promised, not against what the listing says today.
+message ListingForOrder {
+  string                                          listing_id         = 1;
+  string                                          seller_id          = 2;
+  marketplace.reference.v1.ProductCategory        category           = 3;
+  ListingStatus                                   status             = 4;   // caller decides whether ACTIVE is required
+  string                                          title              = 5;
+  int64                                           price_amount       = 6;   // unit price, minor units
+  common.money.v1.Currency                        price_currency     = 7;
+  marketplace.reference.v1.QuantityUnit           quantity_unit      = 8;
+  optional int32                                  quantity_available = 9;
+  marketplace.reference.v1.AvailabilityMode       availability_mode  = 10;
+  optional string                                 readiness_date     = 11;
+  repeated marketplace.reference.v1.DeliveryMethod delivery_methods  = 12;
+  optional common.geo.v1.Oblast                   location_region    = 13;
+  optional string                                 location_city      = 14;
+  string                                          attributes_json    = 15;
+  optional string                                 primary_photo_url  = 16;
+  optional beekeeping.reference.v1.BeeBreed       bee_breed          = 17;
+  optional beekeeping.reference.v1.HoneyType      honey_type         = 18;
+  optional ItemCondition                          item_condition     = 19;
+}
+
+// ---- CreateListing ----------------------------------------------------------
+
+message CreateListingRequest {
+  string                                          seller_id          = 1;
+  marketplace.reference.v1.ProductCategory        category           = 2;   // required, non-UNSPECIFIED
+  string                                          title              = 3;   // required, 3..140
+  optional string                                 description        = 4;   // <= 4000
+  int64                                           price_amount       = 5;   // required, > 0, <= 100_000_000_000
+  common.money.v1.Currency                        price_currency     = 6;   // UNSPECIFIED -> CURRENCY_UAH
+  marketplace.reference.v1.QuantityUnit           quantity_unit      = 7;   // required, non-UNSPECIFIED
+  optional int32                                  quantity_available = 8;   // >= 0, <= 1_000_000; absent = untracked
+  marketplace.reference.v1.AvailabilityMode       availability_mode  = 9;   // required, non-UNSPECIFIED
+  optional string                                 readiness_date     = 10;  // `YYYY-MM-DD`; required iff PRE_ORDER
+  repeated marketplace.reference.v1.DeliveryMethod delivery_methods  = 11;  // may be empty on a draft; every member must be legal for `category`
+  optional common.geo.v1.Oblast                   location_region    = 12;
+  optional string                                 location_city      = 13;
+  optional beekeeping.reference.v1.BeeBreed       bee_breed          = 14;
+  optional beekeeping.reference.v1.HoneyType      honey_type         = 15;
+  optional bool                                   queen_mated        = 16;
+  optional int32                                  queen_year_bred    = 17;
+  optional int32                                  frame_count        = 18;
+  optional int32                                  harvest_year       = 19;
+  optional ItemCondition                          item_condition     = 20;
+  string                                          attributes_json    = 21;  // "" is accepted and means "{}"
+}
+message CreateListingResponse {
+  oneof result {
+    CreateListingSuccess success = 1;
+    CreateListingError   error   = 2;
+  }
+}
+message CreateListingSuccess { Listing listing = 1; }
+enum CreateListingErrorCode {
+  CREATE_LISTING_ERROR_CODE_UNSPECIFIED   = 0;
+  CREATE_LISTING_ERROR_CODE_INVALID_INPUT = 1;
+  CREATE_LISTING_ERROR_CODE_INTERNAL      = 2;
+}
+message CreateListingError {
+  CreateListingErrorCode                code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- UpdateListing ----------------------------------------------------------
+
+message UpdateListingRequest {
+  // DELIBERATELY ABSENT AND MUST NEVER BE ADDED:
+  //   quantity_available — see SetQuantity and spec §3.7.
+  //   status             — see the lifecycle RPCs.
+  //   category           — immutable: changing it invalidates the whole validated
+  //                        attribute set and re-opens the eligibility gate.
+  //   price_currency     — one legal value.
+  //   photos             — see the photo RPCs.
+  string seller_id  = 1;
+  string listing_id = 2;
+
+  // StringValue on a NOT NULL column: absent = unchanged; present-and-empty is
+  // INVALID_INPUT (field "title", reason "too_short"), NOT a clear. `title` is
+  // NOT NULL and 3..140.
+  google.protobuf.StringValue                     title              = 3;
+  // StringValue on a NULLABLE column: absent = unchanged; present-and-empty = CLEAR.
+  google.protobuf.StringValue                     description        = 4;
+  // Int64Value on a NOT NULL column with a CHECK (> 0): absent = unchanged;
+  // present with 0 or negative is INVALID_INPUT, NOT a clear.
+  // *** This is deliberately the OPPOSITE of identity.profiles.v1's Int32Value
+  // convention, where 0 means CLEAR. Do not reuse that mapper here. ***
+  google.protobuf.Int64Value                      price_amount       = 5;
+  // proto3 optional enum on a NOT NULL column: absent = unchanged;
+  // UNSPECIFIED = unchanged (the `specialization` rule, NOT the `apiary_kind` rule).
+  optional marketplace.reference.v1.QuantityUnit  quantity_unit      = 6;
+  optional marketplace.reference.v1.AvailabilityMode availability_mode = 7;
+  // Nullable: absent = unchanged; present-and-empty = CLEAR.
+  google.protobuf.StringValue                     readiness_date     = 8;
+  // Message presence: absent = unchanged; present with values = [] = CLEAR to '{}'.
+  DeliveryMethodList                              delivery_methods   = 9;
+  // proto3 optional enum on a NULLABLE column: absent = unchanged;
+  // UNSPECIFIED = CLEAR (the `apiary_kind` / `location_region` rule).
+  optional common.geo.v1.Oblast                   location_region    = 10;
+  google.protobuf.StringValue                     location_city      = 11;
+  optional beekeeping.reference.v1.BeeBreed       bee_breed          = 12;  // UNSPECIFIED = CLEAR
+  optional beekeeping.reference.v1.HoneyType      honey_type         = 13;  // UNSPECIFIED = CLEAR
+  optional ItemCondition                          item_condition     = 14;  // UNSPECIFIED = CLEAR
+  // Message presence, inner value absent = CLEAR. See BoolUpdate / Int32Update.
+  BoolUpdate                                      queen_mated        = 15;
+  Int32Update                                     queen_year_bred    = 16;
+  Int32Update                                     frame_count        = 17;
+  Int32Update                                     harvest_year       = 18;
+  // Nullable-with-default: absent = unchanged; present-and-empty (or "{}") = CLEAR to
+  // '{}'; otherwise replace the whole object wholesale. There is no JSON merge patch.
+  google.protobuf.StringValue                     attributes_json    = 19;
+}
+message UpdateListingResponse {
+  oneof result {
+    UpdateListingSuccess success = 1;
+    UpdateListingError   error   = 2;
+  }
+}
+message UpdateListingSuccess { Listing listing = 1; }  // full updated row
+enum UpdateListingErrorCode {
+  UPDATE_LISTING_ERROR_CODE_UNSPECIFIED                = 0;
+  UPDATE_LISTING_ERROR_CODE_INVALID_INPUT              = 1;
+  UPDATE_LISTING_ERROR_CODE_NOT_FOUND                  = 2;  // also covers "belongs to another seller"
+  UPDATE_LISTING_ERROR_CODE_INVALID_STATUS_TRANSITION  = 3;  // CLOSED / ARCHIVED / BLOCKED are not editable
+  UPDATE_LISTING_ERROR_CODE_INTERNAL                   = 4;
+}
+message UpdateListingError {
+  UpdateListingErrorCode                code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- SetQuantity ------------------------------------------------------------
+
+message SetQuantityRequest {
+  string seller_id  = 1;
+  string listing_id = 2;
+  // Two-state ON PURPOSE, with no wrapper and no `clear` flag:
+  //   absent          = the listing stops tracking quantity (write NULL).
+  //   present with  0 = ZERO. "None left, listing still up." The listing stays ACTIVE.
+  //   present with  n = set to n.
+  // Read that middle line twice: everywhere else on this platform a present 0 on an
+  // Int32Value means CLEAR. This RPC exists precisely so those two meanings never
+  // occupy the same message (spec §3.7).
+  optional int32 quantity = 3;  // 0 .. 1_000_000
+}
+message SetQuantityResponse {
+  oneof result {
+    SetQuantitySuccess success = 1;
+    SetQuantityError   error   = 2;
+  }
+}
+message SetQuantitySuccess { Listing listing = 1; }
+enum SetQuantityErrorCode {
+  SET_QUANTITY_ERROR_CODE_UNSPECIFIED               = 0;
+  SET_QUANTITY_ERROR_CODE_INVALID_INPUT             = 1;  // negative or above the cap
+  SET_QUANTITY_ERROR_CODE_NOT_FOUND                 = 2;
+  SET_QUANTITY_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;
+  SET_QUANTITY_ERROR_CODE_INTERNAL                  = 4;
+}
+message SetQuantityError {
+  SetQuantityErrorCode                  code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- PublishListing ---------------------------------------------------------
+
+message PublishListingRequest { string seller_id = 1; string listing_id = 2; }
+message PublishListingResponse {
+  oneof result {
+    PublishListingSuccess success = 1;
+    PublishListingError   error   = 2;
+  }
+}
+message PublishListingSuccess { Listing listing = 1; }
+enum PublishListingErrorCode {
+  PUBLISH_LISTING_ERROR_CODE_UNSPECIFIED               = 0;
+  // Any publish-gate rule failed. `fields` is ALWAYS populated — never a bare message.
+  PUBLISH_LISTING_ERROR_CODE_INVALID_INPUT             = 1;
+  PUBLISH_LISTING_ERROR_CODE_NOT_FOUND                 = 2;
+  PUBLISH_LISTING_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;
+  // The category is regulated and the seller does not qualify (spec §3.9). Fails
+  // closed: today no seller can hold the credential, so VET_PREPARATION cannot be
+  // published by anyone. That is the correct direction.
+  PUBLISH_LISTING_ERROR_CODE_NOT_ELIGIBLE              = 4;
+  // The eligibility check could not be RUN — profile-service was unreachable or
+  // errored. Distinct from NOT_ELIGIBLE on purpose: telling a seller they lack a
+  // licence when the truth is that a dependency was down is a support ticket and a
+  // wrong product signal. Still fails closed; still refuses to publish.
+  PUBLISH_LISTING_ERROR_CODE_ELIGIBILITY_UNAVAILABLE   = 5;
+  PUBLISH_LISTING_ERROR_CODE_INTERNAL                  = 6;
+}
+message PublishListingError {
+  PublishListingErrorCode               code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- PauseListing -----------------------------------------------------------
+
+message PauseListingRequest { string seller_id = 1; string listing_id = 2; }
+message PauseListingResponse {
+  oneof result {
+    PauseListingSuccess success = 1;
+    PauseListingError   error   = 2;
+  }
+}
+message PauseListingSuccess { Listing listing = 1; }
+enum PauseListingErrorCode {
+  PAUSE_LISTING_ERROR_CODE_UNSPECIFIED               = 0;
+  PAUSE_LISTING_ERROR_CODE_NOT_FOUND                 = 1;
+  PAUSE_LISTING_ERROR_CODE_INVALID_STATUS_TRANSITION = 2;
+  PAUSE_LISTING_ERROR_CODE_INTERNAL                  = 3;
+}
+message PauseListingError { PauseListingErrorCode code = 1; string message = 2; }
+
+// ---- ResumeListing ----------------------------------------------------------
+//
+// Same six failure reasons as PublishListing, declared separately (no shared
+// message) so each error enum names its own RPC.
+
+message ResumeListingRequest { string seller_id = 1; string listing_id = 2; }
+message ResumeListingResponse {
+  oneof result {
+    ResumeListingSuccess success = 1;
+    ResumeListingError   error   = 2;
+  }
+}
+message ResumeListingSuccess { Listing listing = 1; }
+enum ResumeListingErrorCode {
+  RESUME_LISTING_ERROR_CODE_UNSPECIFIED               = 0;
+  // Any publish-gate rule failed. `fields` is ALWAYS populated — never a bare message.
+  RESUME_LISTING_ERROR_CODE_INVALID_INPUT             = 1;
+  RESUME_LISTING_ERROR_CODE_NOT_FOUND                 = 2;
+  RESUME_LISTING_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;
+  RESUME_LISTING_ERROR_CODE_NOT_ELIGIBLE              = 4;
+  RESUME_LISTING_ERROR_CODE_ELIGIBILITY_UNAVAILABLE   = 5;
+  RESUME_LISTING_ERROR_CODE_INTERNAL                  = 6;
+}
+message ResumeListingError {
+  ResumeListingErrorCode                code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- CloseListing -----------------------------------------------------------
+
+message CloseListingRequest { string seller_id = 1; string listing_id = 2; }
+message CloseListingResponse {
+  oneof result {
+    CloseListingSuccess success = 1;
+    CloseListingError   error   = 2;
+  }
+}
+message CloseListingSuccess { Listing listing = 1; }
+enum CloseListingErrorCode {
+  CLOSE_LISTING_ERROR_CODE_UNSPECIFIED               = 0;
+  CLOSE_LISTING_ERROR_CODE_NOT_FOUND                 = 1;
+  CLOSE_LISTING_ERROR_CODE_INVALID_STATUS_TRANSITION = 2;
+  CLOSE_LISTING_ERROR_CODE_INTERNAL                  = 3;
+}
+message CloseListingError { CloseListingErrorCode code = 1; string message = 2; }
+
+// ---- GetOwnListing ----------------------------------------------------------
+
+message GetOwnListingRequest { string seller_id = 1; string listing_id = 2; }
+message GetOwnListingResponse {
+  oneof result {
+    GetOwnListingSuccess success = 1;
+    GetOwnListingError   error   = 2;
+  }
+}
+message GetOwnListingSuccess { Listing listing = 1; }
+enum GetOwnListingErrorCode {
+  GET_OWN_LISTING_ERROR_CODE_UNSPECIFIED = 0;
+  GET_OWN_LISTING_ERROR_CODE_NOT_FOUND   = 1;  // also covers "belongs to another seller"
+  GET_OWN_LISTING_ERROR_CODE_INTERNAL    = 2;
+}
+message GetOwnListingError { GetOwnListingErrorCode code = 1; string message = 2; }
+
+// ---- ListOwnListings --------------------------------------------------------
+
+message ListOwnListingsRequest {
+  string                seller_id = 1;
+  // Empty = every status. Repeated enum, never a CSV string. Any UNSPECIFIED member
+  // is INVALID_INPUT.
+  repeated ListingStatus statuses = 2;
+  int32                 limit     = 3;  // 0 -> default 20; max 100
+  int32                 offset    = 4;  // >= 0
+}
+message ListOwnListingsResponse {
+  oneof result {
+    ListOwnListingsSuccess success = 1;
+    ListOwnListingsError   error   = 2;
+  }
+}
+message ListOwnListingsSuccess {
+  repeated ListingSummary listings = 1;  // created_at DESC
+  int32                   total    = 2;  // total matching rows, ignoring limit/offset
+}
+enum ListOwnListingsErrorCode {
+  LIST_OWN_LISTINGS_ERROR_CODE_UNSPECIFIED   = 0;
+  LIST_OWN_LISTINGS_ERROR_CODE_INVALID_INPUT = 1;
+  LIST_OWN_LISTINGS_ERROR_CODE_INTERNAL      = 2;
+}
+message ListOwnListingsError {
+  ListOwnListingsErrorCode              code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- AddListingPhoto --------------------------------------------------------
+
+message AddListingPhotoRequest {
+  string seller_id    = 1;
+  string listing_id   = 2;
+  bytes  image        = 3;  // Full file body; the gateway enforces the 2 MiB cap first.
+  string content_type = 4;  // MUST be image/png, image/jpeg or image/webp.
+}
+message AddListingPhotoResponse {
+  oneof result {
+    AddListingPhotoSuccess success = 1;
+    AddListingPhotoError   error   = 2;
+  }
+}
+message AddListingPhotoSuccess {
+  ListingPhoto          photo  = 1;  // The newly created photo.
+  repeated ListingPhoto photos = 2;  // Full gallery after the insert, position ASC.
+}
+enum AddListingPhotoErrorCode {
+  ADD_LISTING_PHOTO_ERROR_CODE_UNSPECIFIED               = 0;
+  ADD_LISTING_PHOTO_ERROR_CODE_INVALID_CONTENT_TYPE      = 1;
+  ADD_LISTING_PHOTO_ERROR_CODE_TOO_LARGE                 = 2;
+  ADD_LISTING_PHOTO_ERROR_CODE_TOO_MANY_PHOTOS           = 3;  // Cap is 8 per listing.
+  ADD_LISTING_PHOTO_ERROR_CODE_NOT_FOUND                 = 4;  // No listing, or another seller's.
+  ADD_LISTING_PHOTO_ERROR_CODE_INVALID_STATUS_TRANSITION = 5;  // CLOSED / ARCHIVED / BLOCKED
+  ADD_LISTING_PHOTO_ERROR_CODE_STORAGE_FAILURE           = 6;
+  ADD_LISTING_PHOTO_ERROR_CODE_INTERNAL                  = 7;
+}
+message AddListingPhotoError { AddListingPhotoErrorCode code = 1; string message = 2; }
+
+// ---- DeleteListingPhoto -----------------------------------------------------
+
+message DeleteListingPhotoRequest { string seller_id = 1; string listing_id = 2; string photo_id = 3; }
+message DeleteListingPhotoResponse {
+  oneof result {
+    DeleteListingPhotoSuccess success = 1;
+    DeleteListingPhotoError   error   = 2;
+  }
+}
+message DeleteListingPhotoSuccess { repeated ListingPhoto photos = 1; }  // renumbered 0..n-1
+enum DeleteListingPhotoErrorCode {
+  DELETE_LISTING_PHOTO_ERROR_CODE_UNSPECIFIED               = 0;
+  DELETE_LISTING_PHOTO_ERROR_CODE_NOT_FOUND                 = 1;
+  DELETE_LISTING_PHOTO_ERROR_CODE_PHOTO_NOT_FOUND           = 2;  // Also covers "belongs to another listing".
+  DELETE_LISTING_PHOTO_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;
+  DELETE_LISTING_PHOTO_ERROR_CODE_INTERNAL                  = 4;
+}
+message DeleteListingPhotoError { DeleteListingPhotoErrorCode code = 1; string message = 2; }
+
+// ---- ReorderListingPhotos ---------------------------------------------------
+
+message ReorderListingPhotosRequest {
+  string          seller_id  = 1;
+  string          listing_id = 2;
+  repeated string photo_ids  = 3;  // MUST be an exact permutation of this listing's photo ids.
+}
+message ReorderListingPhotosResponse {
+  oneof result {
+    ReorderListingPhotosSuccess success = 1;
+    ReorderListingPhotosError   error   = 2;
+  }
+}
+message ReorderListingPhotosSuccess { repeated ListingPhoto photos = 1; }
+enum ReorderListingPhotosErrorCode {
+  REORDER_LISTING_PHOTOS_ERROR_CODE_UNSPECIFIED               = 0;
+  REORDER_LISTING_PHOTOS_ERROR_CODE_INVALID_INPUT             = 1;  // Not an exact permutation.
+  REORDER_LISTING_PHOTOS_ERROR_CODE_NOT_FOUND                 = 2;
+  REORDER_LISTING_PHOTOS_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;
+  REORDER_LISTING_PHOTOS_ERROR_CODE_INTERNAL                  = 4;
+}
+message ReorderListingPhotosError {
+  ReorderListingPhotosErrorCode         code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- GetPublicListing -------------------------------------------------------
+
+message GetPublicListingRequest { string listing_id = 1; }
+message GetPublicListingResponse {
+  oneof result {
+    GetPublicListingSuccess success = 1;
+    GetPublicListingError   error   = 2;
+  }
+}
+message GetPublicListingSuccess { PublicListing listing = 1; }
+enum GetPublicListingErrorCode {
+  GET_PUBLIC_LISTING_ERROR_CODE_UNSPECIFIED = 0;
+  // Unknown id, OR any status other than ACTIVE / PAUSED. One code for both, so the
+  // response cannot be used to discover that a blocked listing exists.
+  GET_PUBLIC_LISTING_ERROR_CODE_NOT_FOUND   = 1;
+  GET_PUBLIC_LISTING_ERROR_CODE_INTERNAL    = 2;
+}
+message GetPublicListingError { GetPublicListingErrorCode code = 1; string message = 2; }
+
+// ---- GetListingForOrder -----------------------------------------------------
+
+message GetListingForOrderRequest { string listing_id = 1; }
+message GetListingForOrderResponse {
+  oneof result {
+    GetListingForOrderSuccess success = 1;
+    GetListingForOrderError   error   = 2;
+  }
+}
+message GetListingForOrderSuccess { ListingForOrder listing = 1; }
+enum GetListingForOrderErrorCode {
+  GET_LISTING_FOR_ORDER_ERROR_CODE_UNSPECIFIED = 0;
+  // Unknown id only. Unlike GetPublicListing this RPC returns every status, because
+  // the caller (orders-service) needs to see that a listing is CLOSED in order to
+  // refuse the order for the right reason.
+  GET_LISTING_FOR_ORDER_ERROR_CODE_NOT_FOUND   = 1;
+  GET_LISTING_FOR_ORDER_ERROR_CODE_INTERNAL    = 2;
+}
+message GetListingForOrderError { GetListingForOrderErrorCode code = 1; string message = 2; }
