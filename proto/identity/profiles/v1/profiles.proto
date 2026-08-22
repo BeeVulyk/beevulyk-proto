@@ -57,6 +57,21 @@ service ProfilesService {
   //   request field `user_id` AND as gRPC metadata `x-authenticated-user-id`.
   rpc AddLabAnalysis(AddLabAnalysisRequest) returns (AddLabAnalysisResponse);
 
+  // Surface: internal — called by listings-service to render trust badges on a
+  //   search result page. MUST NOT be exposed through client-gateway or any
+  //   future admin-gateway. Like GetPublicProfile, an internal caller sends no
+  //   `x-authenticated-user-id` metadata.
+  rpc GetSellerTrustBadges(GetSellerTrustBadgesRequest) returns (GetSellerTrustBadgesResponse);
+
+  // Surface: internal — the ONLY write path that moves verification_status to
+  //   VERIFIED or REJECTED, and therefore the only one that can emit
+  //   ProfileVerificationChanged. Until this RPC existed those transitions
+  //   happened by manual SQL, which no event can observe; a seller verified after
+  //   publishing would have stayed unverified in the marketplace ranking forever.
+  //   MUST NOT be exposed through client-gateway — a user setting their own
+  //   verification flag defeats the entire feature.
+  rpc SetVerificationStatus(SetVerificationStatusRequest) returns (SetVerificationStatusResponse);
+
   // Surface: internal — required by platform convention.
   rpc Ping(PingRequest) returns (PingResponse);
 }
@@ -80,8 +95,11 @@ enum ProfileSpecialization {
 // PENDING document is still shown to buyers.
 //
 // NOT writable through UpdateProfile. Set to PENDING by the service itself
-// when a document is uploaded, and to VERIFIED / REJECTED only by the manual
-// SQL path until admin-gateway exists.
+// when a document is uploaded; VERIFIED / REJECTED are reachable only through
+// the internal SetVerificationStatus RPC, which is the sole write path that
+// emits ProfileVerificationChanged. Do not reintroduce a manual-SQL transition:
+// a status changed behind the service's back produces no event, and the
+// marketplace's verification-first ranking would never see it.
 enum VerificationStatus {
   VERIFICATION_STATUS_UNSPECIFIED = 0;  // Never emitted by the service; reserved.
   VERIFICATION_STATUS_NONE        = 1;  // DB 'none' — nothing submitted.
@@ -212,6 +230,21 @@ message LabAnalysis {
   int64           created_at_ms    = 7;  // When it was uploaded here.
 }
 
+// The search-page projection of a seller's trust signals (spec §4.4).
+// PRESENCE FLAGS AND A COUNT, never document identifiers — see the note on
+// marketplace.listings.v1.SellerTrustBadge, which mirrors this message.
+//
+// Deliberately far lighter than PublicProfile: a catalogue page fetches this for
+// up to 50 sellers at once, and PublicProfile would ship every apiary photo, every
+// lab analysis and both contact values to render a badge.
+message SellerTrustBadge {
+  string             seller_id                      = 1;
+  VerificationStatus verification_status            = 2;
+  bool               has_vet_passport_number        = 3;
+  bool               has_apiary_registration_number = 4;
+  int32              lab_analyses_count             = 5;
+}
+
 // Presence wrappers for the multi-value dictionary fields on UpdateProfile.
 // proto3 `repeated` has no presence, so a bare repeated field cannot
 // distinguish "leave this list alone" from "replace it with the empty list".
@@ -306,8 +339,8 @@ message UpdateProfileRequest {
   // verified_by, verified_at_ms, has_vet_passport_document / the passport
   // file key, photos, lab_analyses. A user setting their own verification
   // flag defeats the entire feature (spec §4.2). Verification status is
-  // written only by the service (on document upload) and by the manual SQL
-  // path.
+  // written only by the service itself (on document upload) and by the
+  // internal SetVerificationStatus RPC, which is never exposed to a client.
   google.protobuf.Int32Value                  started_beekeeping_year    = 10;
   BeeBreedList                                bee_breeds                 = 11;
   HoneyTypeList                               honey_types                = 12;
@@ -552,6 +585,69 @@ enum AddLabAnalysisErrorCode {
 }
 message AddLabAnalysisError {
   AddLabAnalysisErrorCode               code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- GetSellerTrustBadges ---------------------------------------------------
+// Internal, batched. Exists so a search result page costs ONE call to
+// profile-service rather than one per row.
+
+message GetSellerTrustBadgesRequest {
+  // Cap 50 — the search page cap. Above it, INVALID_INPUT. An empty list is
+  // valid and returns an empty `badges`.
+  repeated string seller_ids = 1;
+}
+message GetSellerTrustBadgesResponse {
+  oneof result {
+    GetSellerTrustBadgesSuccess success = 1;
+    GetSellerTrustBadgesError   error   = 2;
+  }
+}
+message GetSellerTrustBadgesSuccess {
+  // Unknown seller ids are OMITTED rather than erroring — a listing whose seller
+  // was deleted must not fail the page. Order is not significant; the caller
+  // joins by seller_id.
+  repeated SellerTrustBadge badges = 1;
+}
+enum GetSellerTrustBadgesErrorCode {
+  GET_SELLER_TRUST_BADGES_ERROR_CODE_UNSPECIFIED   = 0;
+  GET_SELLER_TRUST_BADGES_ERROR_CODE_INVALID_INPUT = 1;  // more than 50 ids, or a malformed id
+  GET_SELLER_TRUST_BADGES_ERROR_CODE_INTERNAL      = 2;
+}
+message GetSellerTrustBadgesError {
+  GetSellerTrustBadgesErrorCode         code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- SetVerificationStatus --------------------------------------------------
+// Internal. The single event-emitting write path for verification_status — see
+// the RPC comment in the service block. Never expose through a gateway.
+
+message SetVerificationStatusRequest {
+  string             user_id             = 1;
+  // VERIFICATION_STATUS_UNSPECIFIED is INVALID_INPUT — this RPC always writes a
+  // concrete status.
+  VerificationStatus verification_status = 2;
+  // 'union' | 'admin'. Required when moving to VERIFIED, ignored otherwise.
+  optional string    verified_by         = 3;
+}
+message SetVerificationStatusResponse {
+  oneof result {
+    SetVerificationStatusSuccess success = 1;
+    SetVerificationStatusError   error   = 2;
+  }
+}
+message SetVerificationStatusSuccess { VerificationStatus verification_status = 1; }  // status AFTER the write
+enum SetVerificationStatusErrorCode {
+  SET_VERIFICATION_STATUS_ERROR_CODE_UNSPECIFIED   = 0;
+  SET_VERIFICATION_STATUS_ERROR_CODE_INVALID_INPUT = 1;
+  SET_VERIFICATION_STATUS_ERROR_CODE_NOT_FOUND     = 2;
+  SET_VERIFICATION_STATUS_ERROR_CODE_INTERNAL      = 3;
+}
+message SetVerificationStatusError {
+  SetVerificationStatusErrorCode        code    = 1;
   string                                message = 2;
   repeated identity.users.v1.FieldError fields  = 3;
 }

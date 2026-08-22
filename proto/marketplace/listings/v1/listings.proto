@@ -92,6 +92,15 @@ service ListingsService {
   //   failing. A missing badge must not take down a catalogue page (spec §3.10).
   rpc GetPublicListing(GetPublicListingRequest) returns (GetPublicListingResponse);
 
+  // Surface: client — PUBLIC, no gateway auth, no metadata. The buyer-facing
+  //   catalogue query. Returns ACTIVE listings only (spec §3.7): PAUSED is
+  //   excluded here even though GetPublicListing still serves it by direct link.
+  //   Carries a per-row trust badge that DEGRADES: if profile-service is
+  //   unreachable the page is returned with every `seller_trust` absent rather
+  //   than failing. A catalogue page must never fail because a badge service is
+  //   down (spec §3.6).
+  rpc SearchListings(SearchListingsRequest) returns (SearchListingsResponse);
+
   // Surface: internal — for orders-service (#47). Returns everything an order
   //   snapshot needs. MUST NOT be exposed through client-gateway or any future
   //   admin-gateway. No caller exists yet.
@@ -230,6 +239,25 @@ message SellerTrustBlock {
   repeated SellerLabAnalysis lab_analyses               = 7;  // analysed_at DESC
 }
 
+// Trust signals rendered beside ONE row of a search result page (spec §4.4).
+//
+// Deliberately NOT `SellerTrustBlock`: this message carries PRESENCE FLAGS and a
+// COUNT, never document identifiers. A search result page is public and
+// uncredentialled; shipping the registration number into it because it was
+// convenient to include is how a public endpoint starts leaking a register.
+//
+// Mirrors identity.profiles.v1.SellerTrustBadge field-for-field, deliberately as a
+// SEPARATE type, for the same reason SellerVerificationStatus mirrors
+// identity.profiles.v1.VerificationStatus: marketplace.listings.v1 must not import
+// identity.profiles.v1. listings-service maps between the two 1:1.
+message SellerTrustBadge {
+  string                   seller_id                      = 1;
+  SellerVerificationStatus verification_status            = 2;
+  bool                     has_vet_passport_number        = 3;
+  bool                     has_apiary_registration_number = 4;  // presence, NEVER the value
+  int32                    lab_analyses_count             = 5;  // count, NEVER the analyses
+}
+
 // Full owner-facing view — returned by CreateListing, UpdateListing, SetQuantity and
 // every lifecycle RPC, and by GetOwnListing.
 message Listing {
@@ -341,6 +369,43 @@ message ListingSummary {
   optional int64                            published_at_ms    = 13;
   int64                                     created_at_ms      = 14;
   int64                                     updated_at_ms      = 15;
+}
+
+// One row of a buyer-facing search page. Deliberately not the full PublicListing:
+// a result list needs a thumbnail and a price, not the attribute tail, the photo
+// gallery or the description.
+//
+// Deliberately NOT `ListingSummary` either, and NOT numbered to track it:
+// ListingSummary is the SELLER's own-listings row — it carries `status` and
+// `updated_at_ms`, and has no `seller_id`, no `location_city` and no trust block.
+// This mirrors how `PublicListing` already sits beside `Listing`.
+//
+// NOTE `primary_photo_url`, not `primary_photo_key`. The DB column is
+// `listing_photos.file_key` and it is a STORAGE KEY, never a URL; every existing
+// message on this platform (ListingPhoto.url, ListingSummary.primary_photo_url,
+// ListingForOrder.primary_photo_url) exposes the derived absolute URL instead.
+// Shipping the raw storage key would break that convention and leak the layout of
+// the object store.
+message PublicListingSummary {
+  string                                    listing_id         = 1;
+  string                                    seller_id          = 2;
+  marketplace.reference.v1.ProductCategory  category           = 3;
+  string                                    title              = 4;
+  int64                                     price_amount       = 5;   // integer minor units (kopiyky)
+  common.money.v1.Currency                  price_currency     = 6;
+  marketplace.reference.v1.QuantityUnit     quantity_unit      = 7;
+  // Absent = untracked/unbounded and ALWAYS visible. Present with 0 = none left.
+  // Never conflate the two (spec §3.7).
+  optional int32                            quantity_available = 8;
+  marketplace.reference.v1.AvailabilityMode availability_mode  = 9;
+  optional string                           readiness_date     = 10;  // `YYYY-MM-DD`, never an instant
+  optional common.geo.v1.Oblast             location_region    = 11;
+  optional string                           location_city      = 12;
+  optional string                           primary_photo_url  = 13;  // the `position ASC` first photo
+  int64                                     published_at_ms    = 14;  // not optional — an ACTIVE listing has been published
+  // Absent when profile-service was unreachable or returned an error. That is the
+  // degrade policy (spec §3.6), not an error path: the RPC still returns Success.
+  optional SellerTrustBadge                 seller_trust       = 15;
 }
 
 // Everything orders-service (#47) must snapshot at order creation. The order copies
@@ -753,6 +818,68 @@ enum GetPublicListingErrorCode {
   GET_PUBLIC_LISTING_ERROR_CODE_INTERNAL    = 2;
 }
 message GetPublicListingError { GetPublicListingErrorCode code = 1; string message = 2; }
+
+// ---- SearchListings ---------------------------------------------------------
+//
+// The buyer-facing catalogue query. All filters are AND-ed with one another;
+// repeated values WITHIN one filter are OR-ed.
+
+// Every filter is a closed enum where a closed dictionary exists — never a string,
+// never a CSV. An unparseable enum value is INVALID_INPUT with a FieldError; it is
+// never silently dropped and never coerced to UNSPECIFIED (spec §4.2).
+//
+// The gateway accepts multi-value filters as comma-separated query parameters and
+// splits them at the HTTP boundary. That is an HTTP-surface decision only — these
+// fields stay `repeated` enums on the wire. Do NOT collapse them into strings.
+message SearchListingsRequest {
+  optional string                                    query               = 1;   // trimmed; <= 100 chars; whitespace-split, EVERY term must match
+  repeated marketplace.reference.v1.ProductCategory  categories          = 2;
+  repeated common.geo.v1.Oblast                      oblasts             = 3;
+  optional int64                                     price_min           = 4;   // minor units
+  optional int64                                     price_max           = 5;   // min > max is INVALID_INPUT, NOT an empty page
+  optional marketplace.reference.v1.AvailabilityMode availability_mode   = 6;
+  repeated beekeeping.reference.v1.BeeBreed          bee_breeds          = 7;
+  optional bool                                      queen_mated         = 8;
+  repeated beekeeping.reference.v1.HoneyType         honey_types         = 9;
+  optional ItemCondition                             item_condition      = 10;
+  repeated marketplace.reference.v1.DeliveryMethod   delivery_methods    = 11;  // array OVERLAP — the listing offers ANY of them
+  optional string                                    readiness_from      = 12;  // `YYYY-MM-DD`, pre-order window
+  optional string                                    readiness_to        = 13;  // `YYYY-MM-DD`
+  optional string                                    seller_id           = 14;  // storefront view — the same RPC, not a separate surface
+  bool                                               include_unavailable = 15;  // default false; see spec §3.7
+  optional string                                    cursor              = 16;  // opaque base64, produced by this service only
+  optional int32                                     page_size           = 17;  // default 20, max 50; ABOVE THE CAP IS CLAMPED, not an error
+}
+message SearchListingsResponse {
+  oneof result {
+    SearchListingsSuccess success = 1;
+    SearchListingsError   error   = 2;
+  }
+}
+message SearchListingsSuccess {
+  // Ordered seller_verified DESC, published_at DESC, listing_id DESC. Fixed —
+  // not selectable by the client, and text relevance is NOT a sort key (spec §3.5).
+  repeated PublicListingSummary listings        = 1;
+  // Absent on the last page.
+  optional string               next_cursor     = 2;
+  // Present ONLY on the first page (no cursor in the request) — spec §3.9.
+  optional int32                total_count     = 3;
+  // The filters AS APPLIED, echoed back so a client that got an empty page can
+  // offer to drop one (spec §3.8). `page_size` is the CLAMPED value and `query` is
+  // the TRIMMED value, so this shows what actually ran, not what was asked for.
+  // The service never broadens a filter the user set — empty results stay empty.
+  SearchListingsRequest         applied_filters = 4;
+}
+enum SearchListingsErrorCode {
+  SEARCH_LISTINGS_ERROR_CODE_UNSPECIFIED   = 0;
+  SEARCH_LISTINGS_ERROR_CODE_INVALID_INPUT = 1;
+  SEARCH_LISTINGS_ERROR_CODE_INTERNAL      = 2;
+}
+message SearchListingsError {
+  SearchListingsErrorCode               code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
 
 // ---- GetListingForOrder -----------------------------------------------------
 
