@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package common.geo.v1;
+
+// Ukrainian administrative geography.
+//
+// This package belongs to no domain: `identity.profiles.v1` uses it for a
+// seller's location, and the marketplace will use it for listing location and
+// delivery scope. Per the package-naming convention it is therefore `common.*`,
+// not `<domain>.reference.*`.
+//
+// Closed dictionary: extending means APPENDING a new numbered value — never
+// renumbering or reusing an existing one.
+//
+// This file declares no service. Surface: shared contract.
+
+// The 24 oblasts of Ukraine plus the city of Kyiv.
+//
+// Deliberately excludes the Autonomous Republic of Crimea and Sevastopol: they
+// are not oblasts, and no commerce is offered there.
+//
+// OBLAST_UNSPECIFIED is never a legal stored value. On an update request it
+// carries the "clear this field" meaning — see UpdateProfileRequest.
+enum Oblast {
+  OBLAST_UNSPECIFIED     = 0;
+  OBLAST_VINNYTSIA       = 1;   // Вінницька
+  OBLAST_VOLYN           = 2;   // Волинська
+  OBLAST_DNIPROPETROVSK  = 3;   // Дніпропетровська
+  OBLAST_DONETSK         = 4;   // Донецька
+  OBLAST_ZHYTOMYR        = 5;   // Житомирська
+  OBLAST_ZAKARPATTIA     = 6;   // Закарпатська
+  OBLAST_ZAPORIZHZHIA    = 7;   // Запорізька
+  OBLAST_IVANO_FRANKIVSK = 8;   // Івано-Франківська
+  OBLAST_KYIV            = 9;   // Київська
+  OBLAST_KIROVOHRAD      = 10;  // Кіровоградська
+  OBLAST_LUHANSK         = 11;  // Луганська
+  OBLAST_LVIV            = 12;  // Львівська
+  OBLAST_MYKOLAIV        = 13;  // Миколаївська
+  OBLAST_ODESA           = 14;  // Одеська
+  OBLAST_POLTAVA         = 15;  // Полтавська
+  OBLAST_RIVNE           = 16;  // Рівненська
+  OBLAST_SUMY            = 17;  // Сумська
+  OBLAST_TERNOPIL        = 18;  // Тернопільська
+  OBLAST_KHARKIV         = 19;  // Харківська
+  OBLAST_KHERSON         = 20;  // Херсонська
+  OBLAST_KHMELNYTSKYI    = 21;  // Хмельницька
+  OBLAST_CHERKASY        = 22;  // Черкаська
+  OBLAST_CHERNIVTSI      = 23;  // Чернівецька
+  OBLAST_CHERNIHIV       = 24;  // Чернігівська
+  OBLAST_KYIV_CITY       = 25;  // м. Київ (city with special status)
+}

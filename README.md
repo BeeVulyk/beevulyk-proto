@@ -19,9 +19,10 @@ build.rs                     # tonic-build invocation
 
 ## Consumption
 
-Services depend on this crate as a **git submodule** at
-`shared-contracts/beevulyk-proto`, then reference the generated types via the
-matching Rust module path, e.g.:
+Services depend on this crate as a **cargo git dependency pinned to a release
+tag** — never as a path dependency, which builds locally and fails in CI where
+the service repo is checked out standalone. Reference the generated types via
+the matching Rust module path, e.g.:
 
 ```rust
 use beevulyk_proto::identity::users::v1::{
@@ -41,6 +42,13 @@ use beevulyk_proto::identity::users::v1::{
 
 ## Current packages
 
-| Package              | Purpose                                       |
-|----------------------|-----------------------------------------------|
-| `identity.users.v1`  | User registration and identity bounded ctx.   |
+| Package                    | Purpose                                                  |
+|----------------------------|----------------------------------------------------------|
+| `identity.users.v1`        | User registration and identity bounded ctx.              |
+| `identity.profiles.v1`     | Seller profiles bounded ctx.                             |
+| `beekeeping.reference.v1`  | Closed dictionaries shared within the beekeeping domain. |
+| `common.geo.v1`            | Ukrainian administrative geography; belongs to no domain.|
+
+Reference (`*.reference.*`) and `common.*` packages declare no service and may
+be imported by anyone. A service package must never be imported by another
+domain's service package.

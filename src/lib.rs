@@ -10,6 +10,14 @@ pub mod beekeeping {
     }
 }
 
+pub mod common {
+    pub mod geo {
+        pub mod v1 {
+            tonic::include_proto!("common.geo.v1");
+        }
+    }
+}
+
 pub mod identity {
     pub mod users {
         pub mod v1 {

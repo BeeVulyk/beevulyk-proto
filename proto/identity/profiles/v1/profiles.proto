@@ -5,6 +5,7 @@ package identity.profiles.v1;
 import "google/protobuf/wrappers.proto";
 import "identity/users/v1/users.proto";  // reuse FieldError
 import "beekeeping/reference/v1/reference.proto";  // shared dictionaries (see spec §3.1)
+import "common/geo/v1/geo.proto";  // Oblast — the single geographic dictionary
 
 // ProfilesService owns the identity/profiles bounded context.
 // gRPC domain service — no HTTP surface (except the SDK-provided
@@ -91,9 +92,22 @@ enum VerificationStatus {
 
 // Full — returned by GetOwnProfile / UpdateProfile.
 message Profile {
+  // location_region was a free-text `string` here. It is now the closed
+  // dictionary common.geo.v1.Oblast at field 26. `string` is wire type 2 and
+  // `enum` is varint wire type 0, so the type could not change in place —
+  // old and new peers would fail to decode rather than degrade. Field 3 is
+  // burned permanently; an old client's value now arrives as an unknown field
+  // and is skipped.
+  //
+  // Only the NUMBER is reserved, not the name: the name is deliberately
+  // carried forward to field 26 so the JSON/HTTP key stays `location_region`
+  // and only its value domain changes. protoc forbids reusing a reserved
+  // name, so `reserved "location_region";` and the rename are mutually
+  // exclusive — reserving 3 is what prevents the decode mismatch.
+  reserved 3;
+
   string                user_id            = 1;
   optional string       display_name       = 2;
-  optional string       location_region    = 3;
   optional string       location_city      = 4;
   optional string       bio                = 5;
   ProfileSpecialization specialization     = 6;
@@ -121,6 +135,9 @@ message Profile {
   optional int64                              verified_at_ms             = 23;  // read-only
   repeated ApiaryPhoto                        photos                     = 24;  // ordered by position ASC
   repeated LabAnalysis                        lab_analyses               = 25;  // ordered by analysed_at DESC
+  // Replaces the reserved field 3. Absent = the seller has not stated an
+  // oblast; OBLAST_UNSPECIFIED is never emitted for a stored value.
+  optional common.geo.v1.Oblast               location_region            = 26;
 }
 
 // Redacted — returned by GetPublicProfile. NB: no visibility flags, no contact values,
@@ -134,9 +151,13 @@ message Profile {
 // carries `has_vet_passport_document` at 19 and this message carries no
 // passport-scan field at all. Do not try to keep the two numerically aligned.
 message PublicProfile {
+  // Same wire break as Profile: field 3 held the free-text `string`, and the
+  // Oblast enum lives at field 24. Number reserved, name carried forward —
+  // see the note on Profile.
+  reserved 3;
+
   string                user_id         = 1;
   optional string       display_name    = 2;
-  optional string       location_region = 3;
   optional string       location_city   = 4;
   optional string       bio             = 5;
   ProfileSpecialization specialization  = 6;
@@ -167,6 +188,9 @@ message PublicProfile {
   // inferred only from whether the value is present.
   optional string                             contact_email              = 22;
   optional string                             contact_phone              = 23;
+  // Replaces the reserved field 3. Numbering diverges from Profile (26) for
+  // the same reason the rest of this message does — do not try to align them.
+  optional common.geo.v1.Oblast               location_region            = 24;
 }
 
 // One image in a seller's apiary gallery. Maximum 10 per user.
@@ -228,9 +252,15 @@ message GetOwnProfileError { GetOwnProfileErrorCode code = 1; string message = 2
 // any other = write that value.
 
 message UpdateProfileRequest {
+  // Field 3 held location_region as a google.protobuf.StringValue. The field
+  // is now the closed dictionary common.geo.v1.Oblast at field 17 — a wire
+  // break (length-delimited message -> varint enum), so the number is burned
+  // rather than reused. Number reserved, name carried forward — see the note
+  // on Profile.
+  reserved 3;
+
   string                                user_id            = 1;
   google.protobuf.StringValue           display_name       = 2;
-  google.protobuf.StringValue           location_region    = 3;
   google.protobuf.StringValue           location_city      = 4;
   google.protobuf.StringValue           bio                = 5;
   optional ProfileSpecialization        specialization     = 6;
@@ -263,6 +293,14 @@ message UpdateProfileRequest {
   //                 profiles.specialization is NOT NULL. profiles.apiary_kind
   //                 IS nullable, so it needs a clear signal. Do not
   //                 copy-paste the specialization mapper. ***
+  //   location_region (proto3 optional enum, field 17): absent = unchanged;
+  //                 present with OBLAST_UNSPECIFIED = CLEAR (write NULL);
+  //                 present with a real value = set.
+  //                 *** This follows the `apiary_kind` rule, NOT the
+  //                 `specialization` rule. profiles.location_region is
+  //                 nullable, so it needs a clear signal and UNSPECIFIED must
+  //                 mean CLEAR. Reusing the specialization mapper here would
+  //                 make the field impossible to clear once set. ***
   //
   // DELIBERATELY ABSENT and MUST NEVER BE ADDED: verification_status,
   // verified_by, verified_at_ms, has_vet_passport_document / the passport
@@ -277,6 +315,7 @@ message UpdateProfileRequest {
   google.protobuf.BoolValue                   open_for_visits            = 14;
   google.protobuf.StringValue                 vet_passport_number        = 15;
   google.protobuf.StringValue                 apiary_registration_number = 16;
+  optional common.geo.v1.Oblast               location_region            = 17;
 }
 message UpdateProfileResponse {
   oneof result {
