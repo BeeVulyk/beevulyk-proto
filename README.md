@@ -47,6 +47,7 @@ use beevulyk_proto::identity::users::v1::{
 | `identity.users.v1`        | User registration and identity bounded ctx.              |
 | `identity.profiles.v1`     | Seller profiles bounded ctx.                             |
 | `marketplace.listings.v1`  | Catalogue listings bounded ctx (CRUD + lifecycle).       |
+| `marketplace.orders.v1`    | Orders bounded ctx (creation + party-scoped reads).      |
 | `beekeeping.reference.v1`  | Closed dictionaries shared within the beekeeping domain. |
 | `marketplace.reference.v1` | Closed dictionaries shared within the marketplace domain.|
 | `common.geo.v1`            | Ukrainian administrative geography; belongs to no domain.|

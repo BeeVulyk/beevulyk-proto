@@ -11,6 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/identity/profiles/v1/profiles.proto",
                 "proto/marketplace/reference/v1/reference.proto",
                 "proto/marketplace/listings/v1/listings.proto",
+                "proto/marketplace/orders/v1/orders.proto",
             ],
             &["proto"],
         )?;

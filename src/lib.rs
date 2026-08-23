@@ -47,4 +47,9 @@ pub mod marketplace {
             tonic::include_proto!("marketplace.listings.v1");
         }
     }
+    pub mod orders {
+        pub mod v1 {
+            tonic::include_proto!("marketplace.orders.v1");
+        }
+    }
 }

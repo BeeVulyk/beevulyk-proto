@@ -1,0 +1,407 @@
+syntax = "proto3";
+
+package marketplace.orders.v1;
+
+// NOTE ON `identity/users/v1/users.proto`: this is a service package importing another
+// domain's service package, which the repo README otherwise forbids. It is imported
+// for exactly one type — `FieldError` — which `identity.profiles.v1` and
+// `marketplace.listings.v1` already reuse the same way. Recorded as accepted debt.
+// Import NOTHING ELSE from identity.*.
+import "identity/users/v1/users.proto";              // reuse FieldError — see the note above
+import "common/money/v1/money.proto";                // Currency
+import "marketplace/reference/v1/reference.proto";   // ProductCategory, QuantityUnit, DeliveryMethod
+
+// OrdersService owns the marketplace/orders bounded context: the order aggregate,
+// its immutable listing snapshots, and its lifecycle.
+//
+// gRPC domain service — no HTTP surface. client-gateway is the only external caller.
+// orders-service is in turn the only caller of marketplace.listings.v1
+// .GetListingForOrder, exactly once, at order creation.
+//
+// ---- NO REQUEST MESSAGE IN THIS PACKAGE CARRIES A PARTY ID ------------------
+//
+// The buyer's / seller's identity is taken from the `x-authenticated-user-id` gRPC
+// metadata header on every client RPC, and NEVER from the request body. There is no
+// `buyer_id` or `seller_id` request field anywhere in this package and none must be
+// added.
+//
+// This DELIBERATELY DIFFERS from `marketplace.listings.v1`, which sends `seller_id`
+// in both the request body and the metadata and rejects a mismatch. A body field
+// whose only permitted value is the metadata value is a redundant field whose sole
+// function is to be rejected: it cannot carry information, it can only carry a bug,
+// and every handler pays for it with a comparison that must never be forgotten.
+//
+// Do NOT "restore consistency" with marketplace.listings.v1 by adding the id back.
+// The divergence is the decision, not an oversight.
+//
+// `buyer_id` and `seller_id` DO appear on the `Order` RESPONSE message — that is a
+// fact about the order being read, not an assertion of who is calling.
+service OrdersService {
+  // Surface: client — the buyer's identity comes from `x-authenticated-user-id`
+  //   metadata ONLY; there is no buyer_id field and one must not be added.
+  //   Creates exactly ONE order from ONE listing with a quantity. There is no cart:
+  //   see the notes on OrderItem.
+  //   This RPC calls marketplace.listings.v1.GetListingForOrder and MUST NOT DEGRADE
+  //   when that call fails — see LISTING_UNAVAILABLE below. The call happens exactly
+  //   once, at creation, and its answer is frozen onto the order as a snapshot; a
+  //   cached, guessed or partial snapshot is an order for the wrong amount, and
+  //   because snapshots are never updated it can never be corrected afterwards. When
+  //   the call fails, NO ROW IS WRITTEN and the RPC returns LISTING_UNAVAILABLE.
+  //
+  //   NOTHING DECREMENTS `quantity_available`. That happens in listings-service, on
+  //   the `marketplace.orders.confirmed` event, in TASK-48. The counter is an
+  //   ADVERTISEMENT, not a reservation ledger: two buyers may both order the last
+  //   queen and the seller declines one. The INSUFFICIENT_QUANTITY check below is a
+  //   courtesy that races by design. Do NOT add locking, reservations or a
+  //   read-modify-write to make it strict.
+  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse);
+
+  // Surface: client — party-scoped. The caller must be the order's buyer or seller;
+  //   anyone else gets NOT_FOUND, never PERMISSION_DENIED, so the RPC is not an
+  //   existence oracle for order ids.
+  rpc GetOrder(GetOrderRequest) returns (GetOrderResponse);
+
+  // Surface: client — orders where the caller is the BUYER.
+  rpc ListOrdersAsBuyer(ListOrdersAsBuyerRequest) returns (ListOrdersAsBuyerResponse);
+
+  // Surface: client — orders where the caller is the SELLER.
+  //   Two RPCs rather than one with a role flag, deliberately: the domain service must
+  //   never infer the caller's role. The gateway picks the RPC by which route was hit.
+  rpc ListOrdersAsSeller(ListOrdersAsSellerRequest) returns (ListOrdersAsSellerResponse);
+
+  // Surface: internal — required by platform convention.
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+// ---- NO TRANSITION RPCs LIVE HERE, AND THAT IS DELIBERATE -------------------
+//
+// `ConfirmOrder`, `RejectOrder`, `CancelOrder`, `MarkReady`, `MarkShipped`,
+// `ConfirmHandover`, `RequestReplacement`, `RespondToReplacement`,
+// `WithdrawReplacement`, `ReportNonDelivery` and `GetSellerOrderStats` belong to
+// TASK-48 and ship with it.
+//
+// Do NOT add them here returning `UNIMPLEMENTED` as placeholders. An RPC that exists
+// and refuses is strictly worse than an absent one: clients build against a declared
+// method, generated stubs make it look supported, and the failure surfaces at runtime
+// in a user's hands instead of at compile time in a developer's editor. An absent RPC
+// fails loudly at the call site, which is where it should fail.
+
+message PingRequest {}
+message PingResponse { int64 server_time_ms = 1; }
+
+// Do not redefine FieldError — reuse `identity.users.v1.FieldError`.
+//
+// Do not define a `Money` message either. `common/money/v1/money.proto` states
+// explicitly that an amount and its currency travel as two sibling fields on the
+// owning message; introducing `Money{amount,currency}` later would be a wire break on
+// every carrier, so it is never added speculatively — including here.
+
+// ---- Enums local to this package --------------------------------------------
+
+// The complete order lifecycle. Only PENDING_CONFIRMATION is reachable in this
+// release — every transition out of it ships with TASK-48. The full set is declared
+// now, not a single value, because the `orders.status` column is TEXT and already
+// accepts all twelve slugs; a partial enum would force the row->proto mapper to fail
+// on values the database legitimately permits.
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED           = 0;  // Never emitted by the service.
+  ORDER_STATUS_PENDING_CONFIRMATION  = 1;
+  ORDER_STATUS_CONFIRMED             = 2;
+  ORDER_STATUS_READY                 = 3;
+  ORDER_STATUS_SHIPPED               = 4;
+  ORDER_STATUS_OBSERVATION           = 5;
+  ORDER_STATUS_REPLACEMENT_REQUESTED = 6;
+  ORDER_STATUS_COMPLETED             = 7;
+  ORDER_STATUS_CLOSED_REPLACED       = 8;
+  ORDER_STATUS_CLOSED_UNRESOLVED     = 9;
+  ORDER_STATUS_REJECTED              = 10;
+  ORDER_STATUS_CANCELLED             = 11;
+  ORDER_STATUS_EXPIRED               = 12;
+}
+
+// Derived ONCE at creation from the item's category via the seeded
+// `orders_service.category_policies` table, then frozen onto the order. Never
+// recomputed. TASK-48's entire guarantee branch keys off the snapshotted
+// observation_window_days, never the policy table.
+enum FulfilmentClass {
+  FULFILMENT_CLASS_UNSPECIFIED = 0;
+  FULFILMENT_CLASS_LIVE        = 1;  // queen_bee, bee_package, bee_colony -> 14-day window
+  FULFILMENT_CLASS_GOODS       = 2;  // everything else -> 0-day window
+}
+
+// Snapshotted and INFORMATIONAL. The platform holds no money (TASK-70) and nothing
+// in this release or in TASK-48 reads this field. It exists so that it is present,
+// populated and understood by the time it becomes load-bearing.
+//
+// COD_NOVA_POSHTA IS DELIBERATELY ABSENT AND MUST NOT BE ADDED. Nova Poshta
+// prohibits sending insects, so offering cash-on-delivery through that carrier would
+// route the wedge category (queens) into a carrier that forbids it — the same reason
+// NOVA_POSHTA is absent from marketplace.reference.v1.DeliveryMethod (TASK-67).
+enum PaymentMethod {
+  PAYMENT_METHOD_UNSPECIFIED          = 0;
+  PAYMENT_METHOD_CASH_ON_PICKUP       = 1;  // paid in person at handover; pairs with SELF_PICKUP
+  PAYMENT_METHOD_CARD_TO_CARD_OFFLINE = 2;  // arranged between the parties; no platform visibility or recourse
+  PAYMENT_METHOD_PREPAY_OFFLINE       = 3;  // buyer paid in advance by agreement; same absence of recourse
+  PAYMENT_METHOD_POSTAL_COD           = 4;  // Ukrposhta pislyaplata. UNVERIFIED: fees, limits and
+                                            // applicability to the live-bee tariff were never researched.
+}
+
+enum PaymentStatus {
+  PAYMENT_STATUS_UNSPECIFIED = 0;
+  PAYMENT_STATUS_UNPAID      = 1;  // the only value this release ever writes
+  PAYMENT_STATUS_PAID        = 2;
+}
+
+// ---- Domain messages --------------------------------------------------------
+
+// One row of the order. Exactly ONE is written per order in this release.
+//
+// `order_items` is NOT a shopping basket — there is no cart in this product despite
+// the feature name. The grain exists for GUARANTEE granularity: a buyer ordering ten
+// queens and five packages from one breeder is one shipment and one 14-day window,
+// and TASK-48's replacement claim must attribute to a specific line. The grain is
+// needed even when the count is one.
+//
+// Every *_snapshot field is frozen at creation and NEVER updated — not by a later
+// listing edit, not by a correction, not by an admin. A guarantee claim is
+// adjudicated against what was promised. If a snapshot is wrong the order is
+// cancelled and a new one placed.
+message OrderItem {
+  string                                   order_item_id            = 1;   // ULID
+  string                                   listing_id               = 2;   // soft reference; no FK, different service
+  int32                                    quantity                 = 3;   // >= 1
+  string                                   title_snapshot           = 4;
+  marketplace.reference.v1.ProductCategory category_snapshot        = 5;
+  int64                                    unit_price_amount        = 6;   // integer minor units (kopiyky)
+  common.money.v1.Currency                 unit_price_currency      = 7;
+  marketplace.reference.v1.QuantityUnit    quantity_unit            = 8;
+  string                                   attributes_snapshot_json = 9;   // JSON object, "{}" when empty
+  int64                                    created_at_ms            = 10;
+}
+
+// The order aggregate as read by either party.
+//
+// DELIBERATELY ABSENT AND NOT TO BE ADDED IN THIS RELEASE: the lifecycle timestamps
+// (`confirmed_at`, `ready_at`, `shipped_at`, `delivered_at`, `observation_ends_at`,
+// `completed_at`), `tracking_number`, `cancelled_by`, `cancellation_reason`,
+// `unresolved_reason`, `replacement_for_order_id`, `replacement_generation` and
+// `next_deadline_at`. Those COLUMNS exist in the table — TASK-48 needs them, and
+// altering a populated table is the risk being avoided — but a proto field is a free,
+// non-breaking append, so the read surface stays scoped to what this release can
+// actually populate. Adding them now would ship fields that are permanently null.
+message Order {
+  string                                  order_id                = 1;   // ULID
+  string                                  buyer_id                = 2;   // ULID
+  string                                  seller_id               = 3;   // ULID
+  OrderStatus                             status                  = 4;
+  FulfilmentClass                         fulfilment_class        = 5;
+  // EXCLUDES shipping. The recipient pays the carrier at the counter by standing
+  // decision, so the platform neither knows nor collects it. There is deliberately
+  // no shipping_cost field: a value that is always absent teaches the reader that
+  // the number exists somewhere, which is exactly wrong.
+  int64                                   total_amount            = 6;   // minor units; unit_price_amount * quantity
+  common.money.v1.Currency                total_currency          = 7;
+  PaymentMethod                           payment_method          = 8;
+  PaymentStatus                           payment_status          = 9;
+  marketplace.reference.v1.DeliveryMethod delivery_method         = 10;
+  optional string                         delivery_address        = 11;  // free text; not normalised in MVP
+  optional string                         readiness_date          = 12;  // YYYY-MM-DD, snapshotted from the listing.
+                                                                         // A calendar date, NOT an instant — do not
+                                                                         // "fix" this to int64 ms.
+  int32                                   observation_window_days = 13;  // snapshot of category policy
+  optional string                         buyer_note              = 14;  // <= 500 chars
+  repeated OrderItem                      items                   = 15;  // exactly one in this release
+  int64                                   created_at_ms           = 16;
+  int64                                   updated_at_ms           = 17;
+}
+
+// ---- CreateOrder ------------------------------------------------------------
+
+message CreateOrderRequest {
+  string                                  listing_id       = 1;
+  int32                                   quantity         = 2;  // >= 1
+  marketplace.reference.v1.DeliveryMethod delivery_method  = 3;  // must be one the listing offers
+  optional string                         delivery_address = 4;
+  PaymentMethod                           payment_method   = 5;
+  // Client-generated ULID. `(buyer_id, idempotency_key)` is unique; a replay returns
+  // the EXISTING order rather than creating a second one. A mobile client on a flaky
+  // connection retries a timed-out request, and the thing being created is an
+  // agreement a human then has to decline — a duplicate here is a second obligation
+  // for the seller, not merely duplicate data. Absent key = no protection, and that
+  // is the client's choice.
+  optional string                         idempotency_key  = 6;
+  optional string                         buyer_note       = 7;  // <= 500 chars
+}
+
+message CreateOrderResponse {
+  oneof result {
+    CreateOrderSuccess success = 1;
+    CreateOrderError   error   = 2;
+  }
+}
+
+message CreateOrderSuccess { Order order = 1; }
+
+enum CreateOrderErrorCode {
+  CREATE_ORDER_ERROR_CODE_UNSPECIFIED           = 0;
+  CREATE_ORDER_ERROR_CODE_INVALID_INPUT         = 1;
+  // The listing id is unknown, OR the listing is in a status the buyer must not even
+  // learn exists: DRAFT, CLOSED, ARCHIVED, BLOCKED. Do not leak that a blocked
+  // listing exists.
+  CREATE_ORDER_ERROR_CODE_NOT_FOUND             = 2;
+  // The listing exists and is publicly visible, but is PAUSED — the seller has
+  // temporarily stopped selling it.
+  CREATE_ORDER_ERROR_CODE_LISTING_NOT_AVAILABLE = 3;
+  // We could not ASK. listings-service was unreachable, timed out, or answered
+  // INTERNAL. NO ROW IS WRITTEN.
+  //
+  // This RPC MUST NOT DEGRADE. Everything else on this platform does: a missing trust
+  // block still renders a listing, missing badges still render a search page, missing
+  // contacts still render a profile. This call does not, and the instinct after those
+  // three will be to degrade here too. There is no safe fallback — an order created
+  // from a guessed or cached price is a contract for the wrong amount, and it is a
+  // contract the platform cannot correct afterwards, because snapshots are never
+  // updated.
+  //
+  // LISTING_NOT_AVAILABLE and LISTING_UNAVAILABLE are DIFFERENT FACTS: "the listing is
+  // paused" versus "we could not ask". Two codes, not one — the client's retry
+  // behaviour differs (never retry the first; retry the second).
+  CREATE_ORDER_ERROR_CODE_LISTING_UNAVAILABLE   = 4;
+  // The authenticated buyer is the listing's seller.
+  CREATE_ORDER_ERROR_CODE_SELF_DEALING          = 5;
+  // quantity exceeds the listing's quantity_available, when that counter is present.
+  // A courtesy check that races by design — see the note on CreateOrder: the counter
+  // is an advertisement, not a reservation ledger, and nothing here decrements it.
+  CREATE_ORDER_ERROR_CODE_INSUFFICIENT_QUANTITY = 6;
+  // Includes: the snapshotted category has no row in category_policies. That is an
+  // INTERNAL error at creation and NEVER a silent default of zero — a silent zero
+  // sells a live queen with no guarantee, discovered fourteen days too late.
+  CREATE_ORDER_ERROR_CODE_INTERNAL              = 7;
+}
+
+message CreateOrderError {
+  CreateOrderErrorCode                  code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- GetOrder ---------------------------------------------------------------
+
+message GetOrderRequest { string order_id = 1; }
+
+message GetOrderResponse {
+  oneof result {
+    GetOrderSuccess success = 1;
+    GetOrderError   error   = 2;
+  }
+}
+
+message GetOrderSuccess {
+  Order order             = 1;
+  // Whether the CALLER is entitled to the counterparty's phone and email, computed
+  // from the order status and which party the caller is. Deliberately on the response
+  // envelope and not on `Order`: it is a fact about the caller, not about the order,
+  // and `Order` also appears in list responses where a caller-relative field would be
+  // misleading.
+  //
+  // This is a TRANSACTIONAL policy and is NOT the profile's `show_contact_*` display
+  // toggles. Those govern whether a stranger browsing a public profile sees a phone
+  // number; a counterparty to a confirmed order is not a stranger browsing, and a
+  // display preference must not silently make a transaction impossible. Two different
+  // questions, two different answers — do NOT route this through profile-service.
+  //
+  // orders-service computes this flag and calls NOBODY. client-gateway executes the
+  // release by calling identity.users.v1.GetUserContacts.
+  //
+  // In this release the flag is ALWAYS false, because nothing can reach CONFIRMED
+  // until TASK-48. Implement it anyway; TASK-48 makes it true.
+  bool  contacts_released = 2;
+}
+
+enum GetOrderErrorCode {
+  GET_ORDER_ERROR_CODE_UNSPECIFIED = 0;
+  // Unknown id, a malformed (non-ULID) id, OR the caller is neither the buyer nor the
+  // seller. All three collapse to NOT_FOUND on purpose — a distinct "forbidden" answer
+  // would turn this RPC into an existence oracle for order ids.
+  GET_ORDER_ERROR_CODE_NOT_FOUND   = 1;
+  GET_ORDER_ERROR_CODE_INTERNAL    = 2;
+}
+
+// No `fields` here — house rule: `repeated FieldError fields` appears only on errors
+// that can return INVALID_INPUT, and this one cannot.
+message GetOrderError { GetOrderErrorCode code = 1; string message = 2; }
+
+// ---- ListOrdersAsBuyer ------------------------------------------------------
+//
+// Owner-scoped list, so this uses the limit/offset + total pagination form of
+// `marketplace.listings.v1.ListOwnListings`, NOT the public catalogue's opaque cursor
+// form. A cursor exists to keep a deep public feed stable and cheap; these lists are
+// scoped to one party's own orders, are small and bounded, and a client that wants
+// page 4 should be able to ask for it.
+
+message ListOrdersAsBuyerRequest {
+  repeated OrderStatus statuses = 1;  // empty = every status
+  int32                limit    = 2;  // 0 -> service default 20; max 100
+  int32                offset   = 3;  // >= 0
+}
+
+message ListOrdersAsBuyerResponse {
+  oneof result {
+    ListOrdersAsBuyerSuccess success = 1;
+    ListOrdersAsBuyerError   error   = 2;
+  }
+}
+
+message ListOrdersAsBuyerSuccess {
+  repeated Order orders = 1;  // created_at DESC
+  int32          total  = 2;  // total matching rows, ignoring limit/offset
+}
+
+enum ListOrdersAsBuyerErrorCode {
+  LIST_ORDERS_AS_BUYER_ERROR_CODE_UNSPECIFIED   = 0;
+  LIST_ORDERS_AS_BUYER_ERROR_CODE_INVALID_INPUT = 1;
+  LIST_ORDERS_AS_BUYER_ERROR_CODE_INTERNAL      = 2;
+}
+
+message ListOrdersAsBuyerError {
+  ListOrdersAsBuyerErrorCode            code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- ListOrdersAsSeller -----------------------------------------------------
+//
+// The buyer-side shapes above, repeated rather than shared. Do NOT collapse the two
+// into one request/response pair with a `role` field: separate types are exactly what
+// keeps a role flag from reappearing, and a role flag would put the decision of whose
+// orders to return into the request body, where a client controls it.
+
+message ListOrdersAsSellerRequest {
+  repeated OrderStatus statuses = 1;  // empty = every status
+  int32                limit    = 2;  // 0 -> service default 20; max 100
+  int32                offset   = 3;  // >= 0
+}
+
+message ListOrdersAsSellerResponse {
+  oneof result {
+    ListOrdersAsSellerSuccess success = 1;
+    ListOrdersAsSellerError   error   = 2;
+  }
+}
+
+message ListOrdersAsSellerSuccess {
+  repeated Order orders = 1;  // created_at DESC
+  int32          total  = 2;  // total matching rows, ignoring limit/offset
+}
+
+enum ListOrdersAsSellerErrorCode {
+  LIST_ORDERS_AS_SELLER_ERROR_CODE_UNSPECIFIED   = 0;
+  LIST_ORDERS_AS_SELLER_ERROR_CODE_INVALID_INPUT = 1;
+  LIST_ORDERS_AS_SELLER_ERROR_CODE_INTERNAL      = 2;
+}
+
+message ListOrdersAsSellerError {
+  ListOrdersAsSellerErrorCode           code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
