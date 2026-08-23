@@ -69,22 +69,127 @@ service OrdersService {
   //   never infer the caller's role. The gateway picks the RPC by which route was hit.
   rpc ListOrdersAsSeller(ListOrdersAsSellerRequest) returns (ListOrdersAsSellerResponse);
 
+  // ---- Lifecycle transitions ------------------------------------------------
+  //
+  // Every RPC below takes the acting party from `x-authenticated-user-id` metadata and
+  // NEVER from the request body — see the package note above. Each one records the
+  // transition in `order_status_history` with the actor type it derived there.
+  //
+  // Three different failures, three different codes, on every transition RPC. They are
+  // three distinct facts and none may be folded into another:
+  //   * unknown / malformed id, or the caller is not a party to this order
+  //       -> NOT_FOUND (the RPC must not be an existence oracle for order ids)
+  //   * the caller IS a party, but not the party entitled to this edge
+  //       -> FORBIDDEN_TRANSITION
+  //   * the edge is not in the transition table for the order's current status
+  //       -> INVALID_STATUS_TRANSITION
+  // A party who is merely not entitled to an edge must NOT be told the order does not
+  // exist: they can already read it through GetOrder, so hiding it would only be a lie
+  // to someone who can see the truth.
+
+  // Surface: client — SELLER only. PENDING_CONFIRMATION -> CONFIRMED.
+  //   A buyer calling this is a party but the wrong one: FORBIDDEN_TRANSITION.
+  rpc ConfirmOrder(ConfirmOrderRequest) returns (ConfirmOrderResponse);
+
+  // Surface: client — SELLER only. PENDING_CONFIRMATION -> REJECTED.
+  //   A reason code is mandatory. REJECTED is a separate terminal state from
+  //   CANCELLED on purpose: declining a request before any agreement exists costs the
+  //   buyer a few days, whereas abandoning a confirmed order in May can cost them the
+  //   season. The reject reason slug is stored in `Order.cancellation_reason` with
+  //   `Order.cancelled_by` left UNSPECIFIED — nobody cancelled a rejected order.
+  rpc RejectOrder(RejectOrderRequest) returns (RejectOrderResponse);
+
+  // Surface: client — BUYER or SELLER. -> CANCELLED.
+  //   Sets `Order.cancelled_by` from the AUTHENTICATED IDENTITY in metadata, never
+  //   from the request body. That is precisely why the request carries no actor field
+  //   and one must not be added: a body field that decides who is blamed is a field a
+  //   client controls.
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
+
+  // Surface: client — SELLER only. CONFIRMED -> READY.
+  rpc MarkReady(MarkReadyRequest) returns (MarkReadyResponse);
+
+  // Surface: client — SELLER only. READY -> SHIPPED. Carries the TTN, free text in MVP.
+  rpc MarkShipped(MarkShippedRequest) returns (MarkShippedResponse);
+
+  // Surface: client — BUYER only. The buyer has the goods.
+  //   ONE RPC COVERS BOTH courier delivery and self-pickup collection, because it is
+  //   ONE FACT: the buyer is holding what they bought. Do NOT split this into
+  //   ConfirmDelivery and ConfirmPickup — the delivery method already distinguishes
+  //   the two, and a second RPC would only give a client a way to assert the wrong one.
+  //   For a LIVE order this opens the observation window; for GOODS it completes.
+  rpc ConfirmHandover(ConfirmHandoverRequest) returns (ConfirmHandoverResponse);
+
+  // Surface: client — BUYER only. OBSERVATION -> REPLACEMENT_REQUESTED.
+  //   The observation window is per ORDER — one delivery is one clock — but claims are
+  //   per ITEM and per QUANTITY. The window must still be open; a late claim is
+  //   WINDOW_CLOSED, not INVALID_STATUS_TRANSITION.
+  rpc RequestReplacement(RequestReplacementRequest) returns (RequestReplacementResponse);
+
+  // Surface: client — SELLER only. Answers a pending claim.
+  //   `accept = true` spawns a CHILD order, returned in `child_order`; the parent
+  //   becomes CLOSED_REPLACED. `accept = false` closes the parent as CLOSED_UNRESOLVED
+  //   with reason SELLER_REFUSED and `child_order` is absent. A seller who never
+  //   answers within T4 produces the same state with reason SELLER_SILENT — the same
+  //   ending, deliberately recorded as a different reason.
+  rpc RespondToReplacement(RespondToReplacementRequest) returns (RespondToReplacementResponse);
+
+  // Surface: client — BUYER only. REPLACEMENT_REQUESTED -> COMPLETED.
+  //   The buyer takes the claim back; the order completes as if it had never been made.
+  rpc WithdrawReplacement(WithdrawReplacementRequest) returns (WithdrawReplacementResponse);
+
+  // Surface: client — BUYER only. SHIPPED -> CLOSED_UNRESOLVED, reason NOT_DELIVERED.
+  //   The parcel never arrived, so there is nothing to observe and no remedy to run.
+  rpc ReportNonDelivery(ReportNonDeliveryRequest) returns (ReportNonDeliveryResponse);
+
+  // Surface: client — BUYER only. Called BEFORE RequestReplacement.
+  //   Returns an opaque storage key that the buyer then passes in
+  //   `ReplacementClaimInput.evidence_keys`. Evidence goes to the PRIVATE storage root
+  //   and has no public URL — a claim photograph is not catalogue content and no HTTP
+  //   handler serves it.
+  //
+  //   THIS IS THE FIRST INLINE BINARY PAYLOAD IN THIS PACKAGE: up to 5 MiB of `bytes`
+  //   in the request. client-gateway's orders client MUST raise its gRPC encoder /
+  //   decoder message-size limit for it — the tonic default of 4 MiB is below the
+  //   documented 5 MiB tier and would reject a legal upload as a transport error.
+  rpc UploadClaimEvidence(UploadClaimEvidenceRequest) returns (UploadClaimEvidenceResponse);
+
+  // Surface: internal — NO gateway route exposes this in this release. It feeds the
+  //   public seller-statistics rule and is called service-to-service only, which is
+  //   also why it is the one RPC here that takes a party id in its body: the caller is
+  //   another service asking about a third party, not a user asserting who they are.
+  rpc GetSellerOrderStats(GetSellerOrderStatsRequest) returns (GetSellerOrderStatsResponse);
+
   // Surface: internal — required by platform convention.
   rpc Ping(PingRequest) returns (PingResponse);
 }
 
-// ---- NO TRANSITION RPCs LIVE HERE, AND THAT IS DELIBERATE -------------------
+// ---- THERE IS NO `OpenDispute` RPC, AND THERE MUST NEVER BE ONE -------------
 //
-// `ConfirmOrder`, `RejectOrder`, `CancelOrder`, `MarkReady`, `MarkShipped`,
-// `ConfirmHandover`, `RequestReplacement`, `RespondToReplacement`,
-// `WithdrawReplacement`, `ReportNonDelivery` and `GetSellerOrderStats` belong to
-// TASK-48 and ship with it.
+// Architecture §9.1 lists one. TASK-66 removed arbitration from the MVP entirely:
+// there is no dispute aggregate, no moderation queue, and nothing on this platform
+// that adjudicates. Do NOT add `OpenDispute`, a `DISPUTE_OPEN` status, or any
+// dispute / arbitration / moderation message — not even a placeholder returning
+// UNIMPLEMENTED. An RPC that exists and refuses is strictly worse than an absent one:
+// clients build against a declared method, generated stubs make it look supported,
+// and the failure surfaces at runtime in a user's hands instead of at compile time in
+// a developer's editor. An absent RPC fails loudly at the call site, which is where it
+// should fail.
 //
-// Do NOT add them here returning `UNIMPLEMENTED` as placeholders. An RPC that exists
-// and refuses is strictly worse than an absent one: clients build against a declared
-// method, generated stubs make it look supported, and the failure surfaces at runtime
-// in a user's hands instead of at compile time in a developer's editor. An absent RPC
-// fails loudly at the call site, which is where it should fail.
+// What this package records instead is the SELLER's replacement commitment
+// (`RequestReplacement` / `RespondToReplacement`). When the seller refuses it or never
+// answers, the order ends in CLOSED_UNRESOLVED and stays there; that state does not
+// auto-resolve in anyone's favour after any delay. Nothing and nobody steps in after
+// it.
+//
+// ---- THERE IS NO `CompleteOrder` RPC EITHER ---------------------------------
+//
+// Completion is buyer-driven or time-driven, never seller-driven. The buyer calls
+// `ConfirmHandover`, and completion then follows either from the buyer
+// (`WithdrawReplacement`, or simply not claiming) or from the deadline sweeper closing
+// the observation window as ActorType SYSTEM. A seller MUST NOT be able to complete
+// their own sale — that is what the timer is for — so no RPC here accepts a seller as
+// the completing actor.
 
 message PingRequest {}
 message PingResponse { int64 server_time_ms = 1; }
@@ -152,6 +257,71 @@ enum PaymentStatus {
   PAYMENT_STATUS_PAID        = 2;
 }
 
+// Who performed a transition. Mirrors the actor_type CHECK on
+// orders_service.order_status_history and the cancelled_by CHECK on orders.
+enum ActorType {
+  ACTOR_TYPE_UNSPECIFIED = 0;
+  ACTOR_TYPE_BUYER       = 1;
+  ACTOR_TYPE_SELLER      = 2;
+  ACTOR_TYPE_SYSTEM      = 3;  // the deadline sweeper; never a human
+}
+
+// Why an order ended with no remedy. CLOSED_UNRESOLVED is terminal and does NOT
+// auto-resolve in anyone's favour after any delay — an order that ended without a
+// remedy must look like one. The reason is kept OUT of `status` so the machine reasons
+// about one edge while the attribution stays queryable.
+enum UnresolvedReason {
+  UNRESOLVED_REASON_UNSPECIFIED       = 0;
+  UNRESOLVED_REASON_NOT_DELIVERED     = 1;  // buyer reported the parcel never arrived
+  UNRESOLVED_REASON_SELLER_REFUSED    = 2;  // seller rejected the replacement claim
+  UNRESOLVED_REASON_SELLER_SILENT     = 3;  // seller never answered within T4
+  UNRESOLVED_REASON_GENERATION_CAPPED = 4;  // claim filed on an order that was already a replacement
+}
+// SELLER_REFUSED and SELLER_SILENT produce the SAME state and MUST remain two distinct
+// values. The difference between a seller who argued and a seller who ignored the buyer
+// is exactly the evidence that matters later; collapsing them destroys it irrecoverably
+// and nothing reconstructs it afterwards.
+
+// What the buyer is claiming. The guarantee this platform records is the SELLER's
+// commitment that a live queen begins laying within the observation window — nothing
+// else. Wrong breed, short count and dead-on-arrival are deliberately ABSENT: with no
+// arbitration there is no aggregate to hold them, and offering a claim code that can
+// only ever end in CLOSED_UNRESOLVED would be an interface that invites a complaint and
+// then does nothing. Do not add a catch-all OTHER value for the same reason.
+enum ClaimReasonCode {
+  CLAIM_REASON_CODE_UNSPECIFIED              = 0;
+  CLAIM_REASON_CODE_QUEEN_NOT_LAYING         = 1;
+  CLAIM_REASON_CODE_COLONY_DID_NOT_ESTABLISH = 2;  // bee package / colony analogue
+}
+
+enum ReplacementClaimStatus {
+  REPLACEMENT_CLAIM_STATUS_UNSPECIFIED = 0;
+  REPLACEMENT_CLAIM_STATUS_REQUESTED   = 1;
+  REPLACEMENT_CLAIM_STATUS_ACCEPTED    = 2;
+  REPLACEMENT_CLAIM_STATUS_REJECTED    = 3;
+  REPLACEMENT_CLAIM_STATUS_WITHDRAWN   = 4;
+}
+
+// Seller declines a request before any agreement exists. REJECTED is a separate state
+// from CANCELLED on purpose: declining a request costs the buyer a few days, whereas
+// abandoning a confirmed order in May can cost them the season.
+enum RejectReasonCode {
+  REJECT_REASON_CODE_UNSPECIFIED           = 0;
+  REJECT_REASON_CODE_OUT_OF_STOCK          = 1;
+  REJECT_REASON_CODE_CANNOT_FULFIL_BY_DATE = 2;
+  REJECT_REASON_CODE_DELIVERY_NOT_POSSIBLE = 3;
+  REJECT_REASON_CODE_BUYER_UNREACHABLE     = 4;
+  REJECT_REASON_CODE_OTHER                 = 5;
+}
+
+enum CancellationReasonCode {
+  CANCELLATION_REASON_CODE_UNSPECIFIED         = 0;
+  CANCELLATION_REASON_CODE_BUYER_CHANGED_MIND  = 1;
+  CANCELLATION_REASON_CODE_SELLER_BATCH_FAILED = 2;  // queens did not mate; first-class, not an excuse
+  CANCELLATION_REASON_CODE_TERMS_NOT_AGREED    = 3;
+  CANCELLATION_REASON_CODE_OTHER               = 4;
+}
+
 // ---- Domain messages --------------------------------------------------------
 
 // One row of the order. Exactly ONE is written per order in this release.
@@ -181,14 +351,14 @@ message OrderItem {
 
 // The order aggregate as read by either party.
 //
-// DELIBERATELY ABSENT AND NOT TO BE ADDED IN THIS RELEASE: the lifecycle timestamps
-// (`confirmed_at`, `ready_at`, `shipped_at`, `delivered_at`, `observation_ends_at`,
-// `completed_at`), `tracking_number`, `cancelled_by`, `cancellation_reason`,
-// `unresolved_reason`, `replacement_for_order_id`, `replacement_generation` and
-// `next_deadline_at`. Those COLUMNS exist in the table — TASK-48 needs them, and
-// altering a populated table is the risk being avoided — but a proto field is a free,
-// non-breaking append, so the read surface stays scoped to what this release can
-// actually populate. Adding them now would ship fields that are permanently null.
+// Fields 1..17 are the 0.9.0 creation-and-read surface. Fields 18..30 are the lifecycle
+// surface, appended here: they were held back from 0.9.0 only because nothing could
+// then populate them, and appending new numbers to an existing message is not a wire
+// break. Nothing in 1..17 changed.
+//
+// Caller-relative facts do NOT belong on this message — `Order` also appears in list
+// responses, where a field about the caller would be misleading. `contacts_released`,
+// the claim list and `buyer_cancellation_count` therefore live on GetOrderSuccess.
 message Order {
   string                                  order_id                = 1;   // ULID
   string                                  buyer_id                = 2;   // ULID
@@ -213,6 +383,68 @@ message Order {
   repeated OrderItem                      items                   = 15;  // exactly one in this release
   int64                                   created_at_ms           = 16;
   int64                                   updated_at_ms           = 17;
+
+  // ---- Lifecycle surface (appended; 1..17 above are untouched) ---------------
+  //
+  // Every instant here is epoch MILLISECONDS, per house rule. `readiness_date` above
+  // stays a YYYY-MM-DD calendar date and is not one of these.
+  optional int64   confirmed_at_ms          = 18;
+  optional int64   ready_at_ms              = 19;
+  optional int64   shipped_at_ms            = 20;
+  optional int64   delivered_at_ms          = 21;  // also the collection instant for self-pickup
+  optional int64   observation_ends_at_ms   = 22;
+  optional int64   completed_at_ms          = 23;
+  optional string  tracking_number          = 24;  // TTN; free text in MVP
+  // UNSPECIFIED when the order was not cancelled. Derived by the service from the
+  // authenticated identity of whoever called CancelOrder — never from a request body.
+  ActorType        cancelled_by             = 25;
+  // Wire slug of CancellationReasonCode OR RejectReasonCode.
+  //
+  // A REJECTED order stores the SELLER'S REJECT REASON slug here with `cancelled_by`
+  // left UNSPECIFIED. The schema is frozen for this run and has no separate
+  // reject-reason column, and a rejection reason is the same kind of fact as a
+  // cancellation reason. Nobody cancelled a rejected order, so `cancelled_by` must stay
+  // unset — read `status` to know which enum the slug came from.
+  optional string  cancellation_reason      = 26;
+  // UNSPECIFIED unless status is CLOSED_UNRESOLVED. Kept out of `status` so the state
+  // machine reasons about one edge while the attribution stays queryable.
+  UnresolvedReason unresolved_reason        = 27;
+  optional string  replacement_for_order_id = 28;  // set on a child order only
+  int32            replacement_generation   = 29;  // 0 for an original order, 1 for a replacement child
+  optional int64   next_deadline_at_ms      = 30;  // the single pending deadline, if any
+}
+
+// One claim line. The observation window is per ORDER (one delivery is one clock) but a
+// claim is per ITEM and per QUANTITY: if three of ten queens never started laying, the
+// remedy concerns three queens on one line.
+//
+// The commitment being claimed against is the SELLER's. This message records what the
+// buyer reported and what the seller answered; it does not record an adjudication,
+// because nothing here adjudicates.
+message ReplacementClaim {
+  string                 claim_id         = 1;   // ULID
+  string                 order_id         = 2;
+  string                 order_item_id    = 3;
+  int32                  quantity_claimed = 4;   // >= 1, <= the item's quantity
+  ClaimReasonCode        reason_code      = 5;
+  optional string        description      = 6;   // <= 1000 chars, free text
+  // OPAQUE PRIVATE-STORAGE KEYS, never public URLs. A claim photograph is not catalogue
+  // content and there is no HTTP handler that serves it. Keys come from
+  // UploadClaimEvidence.
+  repeated string        evidence_keys    = 7;
+  ReplacementClaimStatus status           = 8;
+  optional int64         resolved_at_ms   = 9;
+  int64                  created_at_ms    = 10;
+}
+
+// What the buyer submits inside RequestReplacement. Separate from ReplacementClaim
+// because the service assigns claim_id, order_id, status and the timestamps.
+message ReplacementClaimInput {
+  string          order_item_id    = 1;
+  int32           quantity_claimed = 2;
+  ClaimReasonCode reason_code      = 3;
+  optional string description      = 4;
+  repeated string evidence_keys    = 5;  // keys previously returned by UploadClaimEvidence
 }
 
 // ---- CreateOrder ------------------------------------------------------------
@@ -316,6 +548,18 @@ message GetOrderSuccess {
   // In this release the flag is ALWAYS false, because nothing can reach CONFIRMED
   // until TASK-48. Implement it anyway; TASK-48 makes it true.
   bool  contacts_released = 2;
+
+  // Claims filed against this order, newest last. On the response envelope rather than
+  // on `Order` so that list responses stay light — a list of thirty orders must not
+  // drag every claim line and evidence key with it.
+  repeated ReplacementClaim claims = 3;
+
+  // How many orders this BUYER has cancelled. POPULATED ONLY WHEN THE CALLER IS THE
+  // SELLER; absent otherwise. It exists so a seller can see the buyer's cancellation
+  // history before confirming a booking — the only consequence available on a platform
+  // that holds no money. Caller-relative exactly like `contacts_released`, which is why
+  // it belongs here and not on `Order`.
+  optional int32 buyer_cancellation_count = 4;
 }
 
 enum GetOrderErrorCode {
@@ -402,6 +646,456 @@ enum ListOrdersAsSellerErrorCode {
 
 message ListOrdersAsSellerError {
   ListOrdersAsSellerErrorCode           code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- Lifecycle transitions: requests, responses and error codes -------------
+//
+// The ten transition RPCs share one error SHAPE, written out per RPC rather than
+// hoisted into a shared enum, per house style: a shared enum would drag every RPC's
+// codes into every other RPC's surface, and the per-RPC additions below show why the
+// sets are not actually the same.
+//
+// NONE of these requests carries a buyer_id, seller_id or actor field. See the package
+// note at the top of this file — the acting party is the authenticated caller in
+// `x-authenticated-user-id` metadata, and that is not negotiable across eleven request
+// messages written in a row.
+
+// ---- ConfirmOrder -----------------------------------------------------------
+
+message ConfirmOrderRequest { string order_id = 1; }
+
+message ConfirmOrderResponse {
+  oneof result {
+    ConfirmOrderSuccess success = 1;
+    ConfirmOrderError   error   = 2;
+  }
+}
+
+message ConfirmOrderSuccess { Order order = 1; }
+
+enum ConfirmOrderErrorCode {
+  CONFIRM_ORDER_ERROR_CODE_UNSPECIFIED               = 0;
+  // Unknown order id, a malformed (non-ULID) id, OR the caller is neither the buyer nor
+  // the seller. All collapse to NOT_FOUND so the RPC is not an existence oracle.
+  CONFIRM_ORDER_ERROR_CODE_NOT_FOUND                 = 1;
+  // The caller IS a party to this order, but not the party entitled to this edge — e.g.
+  // a buyer calling ConfirmOrder. A legitimate party, just not the right one. This is
+  // NOT NOT_FOUND: hiding it would be lying to someone who can already see the order.
+  CONFIRM_ORDER_ERROR_CODE_FORBIDDEN_TRANSITION      = 2;
+  // The edge is not in the transition table for the order's current status. A third and
+  // separate fact from the two above: right caller, wrong moment.
+  CONFIRM_ORDER_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;
+  CONFIRM_ORDER_ERROR_CODE_INVALID_INPUT             = 4;
+  CONFIRM_ORDER_ERROR_CODE_INTERNAL                  = 5;
+}
+
+message ConfirmOrderError {
+  ConfirmOrderErrorCode                 code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- RejectOrder ------------------------------------------------------------
+
+message RejectOrderRequest {
+  string           order_id    = 1;
+  RejectReasonCode reason_code = 2;  // mandatory; a bare refusal tells the buyer nothing
+  optional string  reason_note = 3;  // <= 500 chars, free text
+}
+
+message RejectOrderResponse {
+  oneof result {
+    RejectOrderSuccess success = 1;
+    RejectOrderError   error   = 2;
+  }
+}
+
+// The returned order has status REJECTED, `cancellation_reason` set to the reject
+// reason slug, and `cancelled_by` UNSPECIFIED — nobody cancelled a rejected order.
+message RejectOrderSuccess { Order order = 1; }
+
+enum RejectOrderErrorCode {
+  REJECT_ORDER_ERROR_CODE_UNSPECIFIED               = 0;
+  REJECT_ORDER_ERROR_CODE_NOT_FOUND                 = 1;  // unknown/malformed id, or caller is not a party
+  REJECT_ORDER_ERROR_CODE_FORBIDDEN_TRANSITION      = 2;  // a party, but not the one entitled to this edge
+  REJECT_ORDER_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;  // edge absent from the table for this status
+  REJECT_ORDER_ERROR_CODE_INVALID_INPUT             = 4;
+  REJECT_ORDER_ERROR_CODE_INTERNAL                  = 5;
+}
+
+message RejectOrderError {
+  RejectOrderErrorCode                  code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- CancelOrder ------------------------------------------------------------
+
+// Either party may call this, and there is deliberately NO actor field: the service
+// derives `Order.cancelled_by` from the authenticated identity in metadata. A body
+// field naming who cancelled would let a client attribute its own cancellation to the
+// other party.
+message CancelOrderRequest {
+  string                 order_id    = 1;
+  CancellationReasonCode reason_code = 2;
+  optional string        reason_note = 3;  // <= 500 chars, free text
+}
+
+message CancelOrderResponse {
+  oneof result {
+    CancelOrderSuccess success = 1;
+    CancelOrderError   error   = 2;
+  }
+}
+
+message CancelOrderSuccess { Order order = 1; }
+
+enum CancelOrderErrorCode {
+  CANCEL_ORDER_ERROR_CODE_UNSPECIFIED               = 0;
+  CANCEL_ORDER_ERROR_CODE_NOT_FOUND                 = 1;  // unknown/malformed id, or caller is not a party
+  // Reachable even though both parties may cancel: a reason code restricted to the
+  // other side (SELLER_BATCH_FAILED from a buyer) is the wrong party for this edge.
+  CANCEL_ORDER_ERROR_CODE_FORBIDDEN_TRANSITION      = 2;
+  CANCEL_ORDER_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;
+  CANCEL_ORDER_ERROR_CODE_INVALID_INPUT             = 4;
+  CANCEL_ORDER_ERROR_CODE_INTERNAL                  = 5;
+}
+
+message CancelOrderError {
+  CancelOrderErrorCode                  code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- MarkReady --------------------------------------------------------------
+
+message MarkReadyRequest { string order_id = 1; }
+
+message MarkReadyResponse {
+  oneof result {
+    MarkReadySuccess success = 1;
+    MarkReadyError   error   = 2;
+  }
+}
+
+message MarkReadySuccess { Order order = 1; }
+
+enum MarkReadyErrorCode {
+  MARK_READY_ERROR_CODE_UNSPECIFIED               = 0;
+  MARK_READY_ERROR_CODE_NOT_FOUND                 = 1;  // unknown/malformed id, or caller is not a party
+  MARK_READY_ERROR_CODE_FORBIDDEN_TRANSITION      = 2;  // a party, but not the one entitled to this edge
+  MARK_READY_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;  // edge absent from the table for this status
+  MARK_READY_ERROR_CODE_INVALID_INPUT             = 4;
+  MARK_READY_ERROR_CODE_INTERNAL                  = 5;
+}
+
+message MarkReadyError {
+  MarkReadyErrorCode                    code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- MarkShipped ------------------------------------------------------------
+
+message MarkShippedRequest {
+  string          order_id        = 1;
+  optional string tracking_number = 2;  // TTN; free text in MVP, never validated against a carrier
+}
+
+message MarkShippedResponse {
+  oneof result {
+    MarkShippedSuccess success = 1;
+    MarkShippedError   error   = 2;
+  }
+}
+
+message MarkShippedSuccess { Order order = 1; }
+
+enum MarkShippedErrorCode {
+  MARK_SHIPPED_ERROR_CODE_UNSPECIFIED               = 0;
+  MARK_SHIPPED_ERROR_CODE_NOT_FOUND                 = 1;  // unknown/malformed id, or caller is not a party
+  MARK_SHIPPED_ERROR_CODE_FORBIDDEN_TRANSITION      = 2;  // a party, but not the one entitled to this edge
+  MARK_SHIPPED_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;  // edge absent from the table for this status
+  MARK_SHIPPED_ERROR_CODE_INVALID_INPUT             = 4;
+  MARK_SHIPPED_ERROR_CODE_INTERNAL                  = 5;
+}
+
+message MarkShippedError {
+  MarkShippedErrorCode                  code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- ConfirmHandover --------------------------------------------------------
+
+// ONE request for both courier delivery and self-pickup collection. There is no
+// `handover_kind` field and none is needed: the order's delivery_method already says
+// how the goods travelled, and the fact being recorded is the same either way — the
+// buyer has them.
+message ConfirmHandoverRequest { string order_id = 1; }
+
+message ConfirmHandoverResponse {
+  oneof result {
+    ConfirmHandoverSuccess success = 1;
+    ConfirmHandoverError   error   = 2;
+  }
+}
+
+// For a LIVE order the returned order is in OBSERVATION with
+// `observation_ends_at_ms` set; for GOODS it is COMPLETED.
+message ConfirmHandoverSuccess { Order order = 1; }
+
+enum ConfirmHandoverErrorCode {
+  CONFIRM_HANDOVER_ERROR_CODE_UNSPECIFIED               = 0;
+  CONFIRM_HANDOVER_ERROR_CODE_NOT_FOUND                 = 1;  // unknown/malformed id, or caller is not a party
+  // A seller calling this is the clearest case: a party, but completion is the buyer's
+  // to declare. A seller must never be able to close out their own sale.
+  CONFIRM_HANDOVER_ERROR_CODE_FORBIDDEN_TRANSITION      = 2;
+  CONFIRM_HANDOVER_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;
+  CONFIRM_HANDOVER_ERROR_CODE_INVALID_INPUT             = 4;
+  CONFIRM_HANDOVER_ERROR_CODE_INTERNAL                  = 5;
+}
+
+message ConfirmHandoverError {
+  ConfirmHandoverErrorCode              code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- RequestReplacement -----------------------------------------------------
+
+message RequestReplacementRequest {
+  string                         order_id = 1;
+  repeated ReplacementClaimInput claims   = 2;  // >= 1; each item must belong to this order
+}
+
+message RequestReplacementResponse {
+  oneof result {
+    RequestReplacementSuccess success = 1;
+    RequestReplacementError   error   = 2;
+  }
+}
+
+message RequestReplacementSuccess {
+  Order                     order  = 1;
+  repeated ReplacementClaim claims = 2;  // as stored, with ids and timestamps assigned
+}
+
+enum RequestReplacementErrorCode {
+  REQUEST_REPLACEMENT_ERROR_CODE_UNSPECIFIED               = 0;
+  REQUEST_REPLACEMENT_ERROR_CODE_NOT_FOUND                 = 1;  // unknown/malformed id, or caller is not a party
+  REQUEST_REPLACEMENT_ERROR_CODE_FORBIDDEN_TRANSITION      = 2;  // a party, but not the one entitled to this edge
+  REQUEST_REPLACEMENT_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;  // edge absent from the table for this status
+  REQUEST_REPLACEMENT_ERROR_CODE_INVALID_INPUT             = 4;
+  REQUEST_REPLACEMENT_ERROR_CODE_INTERNAL                  = 5;
+  // The observation window has expired. A distinct code from
+  // INVALID_STATUS_TRANSITION because the answer to the buyer is different: not "you
+  // cannot do that here" but "the window this seller committed to has closed".
+  REQUEST_REPLACEMENT_ERROR_CODE_WINDOW_CLOSED             = 6;
+  // An `order_item_id` in the claim list does not belong to this order.
+  REQUEST_REPLACEMENT_ERROR_CODE_ITEM_NOT_FOUND            = 7;
+}
+
+message RequestReplacementError {
+  RequestReplacementErrorCode           code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- RespondToReplacement ---------------------------------------------------
+
+message RespondToReplacementRequest {
+  string          order_id      = 1;
+  bool            accept        = 2;
+  optional string response_note = 3;  // <= 500 chars, free text
+}
+
+message RespondToReplacementResponse {
+  oneof result {
+    RespondToReplacementSuccess success = 1;
+    RespondToReplacementError   error   = 2;
+  }
+}
+
+// With `accept = true` the parent order becomes CLOSED_REPLACED and a CHILD order is
+// created and returned in `child_order` with `replacement_for_order_id` set and
+// `replacement_generation` = 1.
+//
+// With `accept = false` the parent becomes CLOSED_UNRESOLVED with reason
+// SELLER_REFUSED and `child_order` is ABSENT. A seller who simply never answers within
+// T4 lands the order in the same state with reason SELLER_SILENT — the same ending,
+// recorded as a different reason, because who argued and who ignored the buyer is the
+// distinction that matters afterwards.
+message RespondToReplacementSuccess {
+  Order          order       = 1;
+  optional Order child_order = 2;  // present only when accept = true
+}
+
+enum RespondToReplacementErrorCode {
+  RESPOND_TO_REPLACEMENT_ERROR_CODE_UNSPECIFIED               = 0;
+  RESPOND_TO_REPLACEMENT_ERROR_CODE_NOT_FOUND                 = 1;  // unknown/malformed id, or caller is not a party
+  RESPOND_TO_REPLACEMENT_ERROR_CODE_FORBIDDEN_TRANSITION      = 2;  // a party, but not the one entitled to this edge
+  RESPOND_TO_REPLACEMENT_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;  // edge absent from the table for this status
+  RESPOND_TO_REPLACEMENT_ERROR_CODE_INVALID_INPUT             = 4;
+  RESPOND_TO_REPLACEMENT_ERROR_CODE_INTERNAL                  = 5;
+  // The order is in a status that allows a response, but no claim is awaiting one —
+  // it was already answered, or the buyer withdrew it.
+  RESPOND_TO_REPLACEMENT_ERROR_CODE_NO_PENDING_CLAIM          = 6;
+}
+
+message RespondToReplacementError {
+  RespondToReplacementErrorCode         code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- WithdrawReplacement ----------------------------------------------------
+
+message WithdrawReplacementRequest { string order_id = 1; }
+
+message WithdrawReplacementResponse {
+  oneof result {
+    WithdrawReplacementSuccess success = 1;
+    WithdrawReplacementError   error   = 2;
+  }
+}
+
+// The claim becomes WITHDRAWN and the order COMPLETED.
+message WithdrawReplacementSuccess { Order order = 1; }
+
+enum WithdrawReplacementErrorCode {
+  WITHDRAW_REPLACEMENT_ERROR_CODE_UNSPECIFIED               = 0;
+  WITHDRAW_REPLACEMENT_ERROR_CODE_NOT_FOUND                 = 1;  // unknown/malformed id, or caller is not a party
+  WITHDRAW_REPLACEMENT_ERROR_CODE_FORBIDDEN_TRANSITION      = 2;  // a party, but not the one entitled to this edge
+  WITHDRAW_REPLACEMENT_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;  // edge absent from the table for this status
+  WITHDRAW_REPLACEMENT_ERROR_CODE_INVALID_INPUT             = 4;
+  WITHDRAW_REPLACEMENT_ERROR_CODE_INTERNAL                  = 5;
+}
+
+message WithdrawReplacementError {
+  WithdrawReplacementErrorCode          code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- ReportNonDelivery ------------------------------------------------------
+
+message ReportNonDeliveryRequest {
+  string          order_id = 1;
+  optional string note     = 2;  // <= 500 chars, free text
+}
+
+message ReportNonDeliveryResponse {
+  oneof result {
+    ReportNonDeliverySuccess success = 1;
+    ReportNonDeliveryError   error   = 2;
+  }
+}
+
+// The order becomes CLOSED_UNRESOLVED with reason NOT_DELIVERED. Nothing arrives, so
+// there is nothing to observe and no replacement clock to start; the order is recorded
+// as having ended without a remedy and stays that way.
+message ReportNonDeliverySuccess { Order order = 1; }
+
+enum ReportNonDeliveryErrorCode {
+  REPORT_NON_DELIVERY_ERROR_CODE_UNSPECIFIED               = 0;
+  REPORT_NON_DELIVERY_ERROR_CODE_NOT_FOUND                 = 1;  // unknown/malformed id, or caller is not a party
+  REPORT_NON_DELIVERY_ERROR_CODE_FORBIDDEN_TRANSITION      = 2;  // a party, but not the one entitled to this edge
+  REPORT_NON_DELIVERY_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;  // edge absent from the table for this status
+  REPORT_NON_DELIVERY_ERROR_CODE_INVALID_INPUT             = 4;
+  REPORT_NON_DELIVERY_ERROR_CODE_INTERNAL                  = 5;
+}
+
+message ReportNonDeliveryError {
+  ReportNonDeliveryErrorCode            code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- UploadClaimEvidence ----------------------------------------------------
+
+// INLINE BINARY, up to 5 MiB — the first and only binary payload in this package. The
+// gateway's orders client must raise its gRPC message-size limits accordingly; the
+// tonic default of 4 MiB sits below the documented tier and would turn a legal upload
+// into a transport error that looks like a service fault.
+message UploadClaimEvidenceRequest {
+  string order_id     = 1;
+  bytes  file         = 2;  // <= 5 MiB
+  string content_type = 3;  // image/jpeg, image/png, image/webp
+}
+
+message UploadClaimEvidenceResponse {
+  oneof result {
+    UploadClaimEvidenceSuccess success = 1;
+    UploadClaimEvidenceError   error   = 2;
+  }
+}
+
+// An OPAQUE PRIVATE-STORAGE KEY, not a URL. The buyer passes it back in
+// `ReplacementClaimInput.evidence_keys`. Nothing serves this object over HTTP.
+message UploadClaimEvidenceSuccess { string evidence_key = 1; }
+
+enum UploadClaimEvidenceErrorCode {
+  UPLOAD_CLAIM_EVIDENCE_ERROR_CODE_UNSPECIFIED               = 0;
+  UPLOAD_CLAIM_EVIDENCE_ERROR_CODE_NOT_FOUND                 = 1;  // unknown/malformed id, or caller is not a party
+  UPLOAD_CLAIM_EVIDENCE_ERROR_CODE_FORBIDDEN_TRANSITION      = 2;  // a party, but evidence is the buyer's to file
+  UPLOAD_CLAIM_EVIDENCE_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;  // the order cannot carry a claim in its current status
+  UPLOAD_CLAIM_EVIDENCE_ERROR_CODE_INVALID_INPUT             = 4;
+  UPLOAD_CLAIM_EVIDENCE_ERROR_CODE_INTERNAL                  = 5;
+  UPLOAD_CLAIM_EVIDENCE_ERROR_CODE_PAYLOAD_TOO_LARGE         = 6;  // over 5 MiB
+  UPLOAD_CLAIM_EVIDENCE_ERROR_CODE_UNSUPPORTED_CONTENT_TYPE  = 7;
+  // The bytes arrived and were valid, but the private storage root rejected the write.
+  // Distinct from INTERNAL so the client knows a retry is worth attempting.
+  UPLOAD_CLAIM_EVIDENCE_ERROR_CODE_STORAGE_FAILURE           = 8;
+}
+
+message UploadClaimEvidenceError {
+  UploadClaimEvidenceErrorCode          code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- GetSellerOrderStats ----------------------------------------------------
+//
+// INTERNAL. No gateway route exposes it in this release. It is a query, not a
+// transition, so it has neither FORBIDDEN_TRANSITION nor INVALID_STATUS_TRANSITION.
+//
+// `seller_id` in the body is NOT a violation of the no-party-id rule above. That rule
+// governs the CALLER's identity on client RPCs, which must come from metadata. Here the
+// caller is another service asking about a third party, and the subject of the question
+// has to be stated somewhere.
+message GetSellerOrderStatsRequest { string seller_id = 1; }
+
+message GetSellerOrderStatsResponse {
+  oneof result {
+    GetSellerOrderStatsSuccess success = 1;
+    GetSellerOrderStatsError   error   = 2;
+  }
+}
+
+message GetSellerOrderStatsSuccess {
+  int32 completed_orders_count    = 1;
+  int32 buyer_cancellation_count  = 2;  // cancellations by BUYERS against this seller
+  int32 seller_cancellation_count = 3;  // cancellations by this seller after confirming
+  int32 unresolved_count          = 4;
+  // FALSE until the seller has enough completed orders for the ratio to mean anything.
+  // A caller MUST NOT display unresolved_count when this is false, and MUST NOT display
+  // it without completed_orders_count beside it when it is true: one refusal in fifty
+  // reads differently from one in one, and only the pair is informative. Enforced here
+  // rather than trusted to each client.
+  bool  stats_display_eligible    = 5;
+}
+
+enum GetSellerOrderStatsErrorCode {
+  GET_SELLER_ORDER_STATS_ERROR_CODE_UNSPECIFIED   = 0;
+  GET_SELLER_ORDER_STATS_ERROR_CODE_INVALID_INPUT = 1;
+  GET_SELLER_ORDER_STATS_ERROR_CODE_INTERNAL      = 2;
+}
+
+message GetSellerOrderStatsError {
+  GetSellerOrderStatsErrorCode          code    = 1;
   string                                message = 2;
   repeated identity.users.v1.FieldError fields  = 3;
 }
