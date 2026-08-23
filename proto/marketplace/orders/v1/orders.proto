@@ -120,6 +120,26 @@ service OrdersService {
   //   For a LIVE order this opens the observation window; for GOODS it completes.
   rpc ConfirmHandover(ConfirmHandoverRequest) returns (ConfirmHandoverResponse);
 
+  // Surface: client — BUYER only. OBSERVATION -> COMPLETED.
+  //   The buyer's EARLY EXIT from an observation window that would otherwise close on
+  //   its own at T3. Nothing is lost by not calling it — the deadline sweeper reaches
+  //   the same state as ActorType SYSTEM — but for the wedge category it is the whole
+  //   point: a buyer whose queens ARE laying should not have to sit out fourteen days
+  //   to close a sale that already went right.
+  //
+  //   A SELLER CALLING THIS IS FORBIDDEN_TRANSITION, always and in every status. A
+  //   seller must never be able to complete their own sale; the timer is what closes
+  //   the window when the buyer stays silent, and that timer is the seller's only
+  //   route to COMPLETED. Do not add a seller edge here, and do not let the sweeper
+  //   call this RPC — the sweeper writes ActorType SYSTEM directly.
+  //
+  //   This RPC is NOT how the zero-window paths complete. For FULFILMENT_CLASS_GOODS
+  //   the observation window is zero days and ConfirmHandover completes the order
+  //   outright, self-pickup included; there is no OBSERVATION state to exit. Calling
+  //   this on such an order is INVALID_STATUS_TRANSITION, not a second way to do the
+  //   same thing.
+  rpc CompleteOrder(CompleteOrderRequest) returns (CompleteOrderResponse);
+
   // Surface: client — BUYER only. OBSERVATION -> REPLACEMENT_REQUESTED.
   //   The observation window is per ORDER — one delivery is one clock — but claims are
   //   per ITEM and per QUANTITY. The window must still be open; a late claim is
@@ -182,14 +202,28 @@ service OrdersService {
 // auto-resolve in anyone's favour after any delay. Nothing and nobody steps in after
 // it.
 //
-// ---- THERE IS NO `CompleteOrder` RPC EITHER ---------------------------------
+// ---- `CompleteOrder` EXISTS, AND IT IS BUYER-ONLY ---------------------------
 //
-// Completion is buyer-driven or time-driven, never seller-driven. The buyer calls
-// `ConfirmHandover`, and completion then follows either from the buyer
-// (`WithdrawReplacement`, or simply not claiming) or from the deadline sweeper closing
-// the observation window as ActorType SYSTEM. A seller MUST NOT be able to complete
-// their own sale — that is what the timer is for — so no RPC here accepts a seller as
-// the completing actor.
+// 0.10.0 carried a comment here asserting the opposite — that no such RPC existed. It
+// was wrong. The normative transition table in the lifecycle spec lists
+// `OBSERVATION -> COMPLETED | buyer early, or system T3` and calls it the default
+// outcome; the spec's own RPC table simply omitted the method. Constraining the ACTOR
+// of an RPC is only meaningful for an RPC that exists, so "buyer-only" was always a
+// statement that it does. The edge is real and is now declared above.
+//
+// COMPLETION IS BUYER-DRIVEN OR TIME-DRIVEN, NEVER SELLER-DRIVEN. That much of the old
+// comment was right and still holds. A seller MUST NOT be able to complete their own
+// sale, in any status, by any route — that is exactly what the deadline sweeper is for.
+// When the buyer says nothing, the sweeper closes the observation window at T3 and
+// records ActorType SYSTEM. That is the seller's only path to COMPLETED, and no RPC in
+// this package accepts a seller as the completing actor. `CompleteOrder` is the BUYER's
+// early exit from a window that would otherwise close on its own; it changes WHEN the
+// order completes, never WHO may complete it.
+//
+// Completion also arrives without this RPC on the paths that never open a window: for
+// FULFILMENT_CLASS_GOODS the observation window is zero days and `ConfirmHandover`
+// completes the order directly, self-pickup included. And a buyer who has filed a claim
+// completes by `WithdrawReplacement`, not by this RPC.
 
 message PingRequest {}
 message PingResponse { int64 server_time_ms = 1; }
@@ -652,14 +686,14 @@ message ListOrdersAsSellerError {
 
 // ---- Lifecycle transitions: requests, responses and error codes -------------
 //
-// The ten transition RPCs share one error SHAPE, written out per RPC rather than
+// The eleven transition RPCs share one error SHAPE, written out per RPC rather than
 // hoisted into a shared enum, per house style: a shared enum would drag every RPC's
 // codes into every other RPC's surface, and the per-RPC additions below show why the
 // sets are not actually the same.
 //
 // NONE of these requests carries a buyer_id, seller_id or actor field. See the package
 // note at the top of this file — the acting party is the authenticated caller in
-// `x-authenticated-user-id` metadata, and that is not negotiable across eleven request
+// `x-authenticated-user-id` metadata, and that is not negotiable across twelve request
 // messages written in a row.
 
 // ---- ConfirmOrder -----------------------------------------------------------
@@ -860,6 +894,51 @@ enum ConfirmHandoverErrorCode {
 
 message ConfirmHandoverError {
   ConfirmHandoverErrorCode              code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- CompleteOrder ----------------------------------------------------------
+
+// The order id and nothing else. NO PARTY ID — the completing buyer is the
+// authenticated caller in `x-authenticated-user-id` metadata, exactly as on every other
+// transition RPC in this package. A body field naming the completing actor is precisely
+// how a seller would complete their own sale.
+message CompleteOrderRequest { string order_id = 1; }
+
+message CompleteOrderResponse {
+  oneof result {
+    CompleteOrderSuccess success = 1;
+    CompleteOrderError   error   = 2;
+  }
+}
+
+// The returned order is COMPLETED with `completed_at_ms` set and
+// `next_deadline_at_ms` cleared — the T3 sweep the buyer just pre-empted is no longer
+// pending. Identical in shape to the state the sweeper would have produced, differing
+// only in the ActorType recorded in `order_status_history`: BUYER here, SYSTEM there.
+message CompleteOrderSuccess { Order order = 1; }
+
+enum CompleteOrderErrorCode {
+  COMPLETE_ORDER_ERROR_CODE_UNSPECIFIED               = 0;
+  COMPLETE_ORDER_ERROR_CODE_NOT_FOUND                 = 1;  // unknown/malformed id, or caller is not a party
+  // A SELLER calling this. They are a party to the order, but completion is the buyer's
+  // to declare and the timer is the seller's only route to it. Never NOT_FOUND: the
+  // seller can already read this order through GetOrder.
+  COMPLETE_ORDER_ERROR_CODE_FORBIDDEN_TRANSITION      = 2;
+  // Right caller, wrong moment. Includes a GOODS order already COMPLETED by
+  // ConfirmHandover, and an order in REPLACEMENT_REQUESTED — a buyer who has filed a
+  // claim completes by withdrawing it, not by this RPC.
+  COMPLETE_ORDER_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;
+  COMPLETE_ORDER_ERROR_CODE_INVALID_INPUT             = 4;
+  COMPLETE_ORDER_ERROR_CODE_INTERNAL                  = 5;
+}
+
+// No WINDOW_CLOSED code, deliberately, and it must not be added. A closed window is not
+// an error on this edge: if T3 already fired the order is COMPLETED, which is the
+// outcome the buyer was asking for. There is no late-completion failure to report.
+message CompleteOrderError {
+  CompleteOrderErrorCode                code    = 1;
   string                                message = 2;
   repeated identity.users.v1.FieldError fields  = 3;
 }
