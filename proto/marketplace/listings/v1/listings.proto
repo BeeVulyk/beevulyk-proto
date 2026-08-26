@@ -43,6 +43,9 @@ service ListingsService {
   //   which is a meaningful state; under the platform's Int32Value convention 0
   //   means CLEAR. The two zero-semantics must never share a request message
   //   (spec §3.7).
+  //   The RPC writes `quantity_total` — the seller's own stock — and a value below
+  //   `quantity_reserved` is REFUSED with SET_QUANTITY_ERROR_CODE_BELOW_RESERVED,
+  //   never clamped.
   rpc SetQuantity(SetQuantityRequest) returns (SetQuantityResponse);
 
   // Surface: client — `seller_id` in the field AND in `x-authenticated-user-id`.
@@ -271,9 +274,20 @@ message Listing {
   int64                                           price_amount       = 7;   // INTEGER MINOR UNITS (kopiyky). Never a float, never a bare number.
   common.money.v1.Currency                        price_currency     = 8;   // CURRENCY_UAH today; single legal value
   marketplace.reference.v1.QuantityUnit           quantity_unit      = 9;
-  // Soft counter, eventually consistent (spec §3.7). Absent = not tracked.
-  // Present with 0 = none left, listing still up. `sold_out` is NOT a status — it is
-  // derived at read time from this field. Do not store one.
+  // Derived, never stored independently: `quantity_total - quantity_reserved`, a
+  // generated column. Soft counter, eventually consistent (spec §3.7). Absent = not
+  // tracked. Present with 0 = none left, listing still up. `sold_out` is NOT a status
+  // — it is derived at read time from this field. Do not store one.
+  //
+  // The MEANING is unchanged — "orderable now" — and so is the number and the type.
+  // What changed is which number is writable: SetQuantity now writes `quantity_total`
+  // and this value follows from it. Nothing downstream (gateway DTO, search filter,
+  // index) has to change.
+  //
+  // On this SELLER-FACING message the value may be NEGATIVE, when a seller has
+  // oversold — confirmed more units than he owns. Overselling remains a legitimate
+  // state, resolved by a human declining an order (spec §3.1), not by clamping. The
+  // public messages are floored at zero by the service.
   optional int32                                  quantity_available = 10;
 
   marketplace.reference.v1.AvailabilityMode       availability_mode  = 11;
@@ -305,6 +319,23 @@ message Listing {
   optional int64                                  published_at_ms    = 25;
   int64                                           created_at_ms      = 26;
   int64                                           updated_at_ms      = 27;
+
+  // Units committed to CONFIRMED orders the seller has not yet dispatched.
+  // Written ONLY by the order consumer, never by any RPC — there is deliberately no
+  // way for a seller to set this. Absent exactly when `quantity_available` is absent,
+  // i.e. when the listing does not track quantity at all: an untracked listing never
+  // reserves and never consumes, and a present 0 here must never be confused with an
+  // absent value.
+  //
+  // SELLER-FACING ONLY. This field MUST NOT be added to `PublicListing` or
+  // `PublicListingSummary`. How much a seller has committed to other buyers is not a
+  // shopper's business, and publishing it invites inference about a competitor's order
+  // flow. It MUST NOT be added to `ListingForOrder` either: that is the snapshot
+  // orders-service freezes at order creation, and an order records what was promised
+  // to THAT buyer, not the seller's commitment book — widening it would freeze an
+  // unrelated, already-stale number into every order row for no reader. Do not
+  // "complete the set".
+  optional int32                                  quantity_reserved  = 28;
 }
 
 // Buyer-facing view — returned by GetPublicListing. Field numbers track `Listing`
@@ -369,6 +400,11 @@ message ListingSummary {
   optional int64                            published_at_ms    = 13;
   int64                                     created_at_ms      = 14;
   int64                                     updated_at_ms      = 15;
+  // Units committed to confirmed, undispatched orders — see `Listing.quantity_reserved`
+  // for the full rules. A seller scanning their own list is exactly who needs to see
+  // what is committed, which is why the summary carries it. SELLER-FACING ONLY: it is
+  // deliberately absent from `PublicListingSummary`.
+  optional int32                            quantity_reserved  = 16;
 }
 
 // One row of a buyer-facing search page. Deliberately not the full PublicListing:
@@ -571,6 +607,16 @@ enum SetQuantityErrorCode {
   SET_QUANTITY_ERROR_CODE_NOT_FOUND                 = 2;
   SET_QUANTITY_ERROR_CODE_INVALID_STATUS_TRANSITION = 3;
   SET_QUANTITY_ERROR_CODE_INTERNAL                  = 4;
+  // The requested quantity is below the number of units already committed to CONFIRMED
+  // orders. Refused, never clamped: you cannot edit your way out of a promise.
+  // Withdrawing a commitment is cancelling the order, not lowering a number — and a
+  // silent clamp would tell the seller he set 3 and leave him with 5, to find out
+  // later. This also covers setting the quantity to UNTRACKED (request `quantity`
+  // absent) while units are reserved, because untracking would strand the reservation
+  // permanently. The accompanying FieldError carries `field: "quantity"`,
+  // `reason: "below_reserved"`, and the human-readable `message` NAMES the reserved
+  // figure so the seller knows what he is up against.
+  SET_QUANTITY_ERROR_CODE_BELOW_RESERVED            = 5;
 }
 message SetQuantityError {
   SetQuantityErrorCode                  code    = 1;
