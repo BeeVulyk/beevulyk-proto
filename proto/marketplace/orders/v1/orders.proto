@@ -1165,6 +1165,22 @@ message GetSellerOrderStatsSuccess {
   // reads differently from one in one, and only the pair is informative. Enforced here
   // rather than trusted to each client.
   bool  stats_display_eligible    = 5;
+  // Distinct BUYERS across this seller's COMPLETED orders only — the
+  // denominator that makes completed_orders_count mean something. Twenty
+  // orders from one buyer and twenty from twenty buyers are the same number
+  // without it, and the first shape is what two colluding accounts produce
+  // for free. Counted over completed orders only, matching
+  // completed_orders_count, so the pair reads as a fraction; counting
+  // distinct buyers across ALL statuses would let a colluder inflate the
+  // denominator with cancellations and invert the signal.
+  int32 distinct_counterparty_count = 6;
+  // Requests this seller DECLINED, kept separate from
+  // seller_cancellation_count on purpose: declining a request costs a buyer
+  // a few days, abandoning a CONFIRMED order in May costs them the season.
+  // Folding the two together would make a cautious seller who declines what
+  // he cannot fill look identical to one who strands buyers after
+  // committing.
+  int32 rejected_count = 7;
 }
 
 enum GetSellerOrderStatsErrorCode {

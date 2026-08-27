@@ -156,6 +156,21 @@ message Profile {
   // Replaces the reserved field 3. Absent = the seller has not stated an
   // oblast; OBLAST_UNSPECIFIED is never emitted for a stored value.
   optional common.geo.v1.Oblast               location_region            = 26;
+  // Live counters from orders-service (spec 3.1). ABSENT means the source
+  // was unreachable, which is NOT the same fact as a seller with zero
+  // completed orders: zero is a statement about the seller, absent is a
+  // statement about the platform. Never render zeros on failure.
+  //
+  // Present here as well as on PublicProfile because there is no privileged
+  // view: what a seller sees on their own profile is exactly what a buyer
+  // sees, eligibility rule included. Showing a seller a statistic buyers
+  // cannot see would make them optimise against a number nobody reads;
+  // hiding one buyers can see would be dishonest.
+  //
+  // Field 27 here versus 25 on PublicProfile — the divergence is the same
+  // one that runs through both messages from field 16 onward. Do not try to
+  // align them.
+  optional SellerOrderStats                   seller_order_stats         = 27;
 }
 
 // Redacted — returned by GetPublicProfile. NB: no visibility flags, no contact values,
@@ -209,6 +224,11 @@ message PublicProfile {
   // Replaces the reserved field 3. Numbering diverges from Profile (26) for
   // the same reason the rest of this message does — do not try to align them.
   optional common.geo.v1.Oblast               location_region            = 24;
+  // Live counters from orders-service (spec 3.1). ABSENT means the source
+  // was unreachable, which is NOT the same fact as a seller with zero
+  // completed orders: zero is a statement about the seller, absent is a
+  // statement about the platform. Never render zeros on failure.
+  optional SellerOrderStats                   seller_order_stats         = 25;
 }
 
 // One image in a seller's apiary gallery. Maximum 10 per user.
@@ -243,6 +263,57 @@ message SellerTrustBadge {
   bool               has_vet_passport_number        = 3;
   bool               has_apiary_registration_number = 4;
   int32              lab_analyses_count             = 5;
+}
+
+// Live order counters for this seller, read from orders-service on every
+// profile read and never stored here (spec 3.1). Deliberately mirrors
+// marketplace.orders.v1.GetSellerOrderStatsSuccess field-for-field —
+// same names AND same field numbers — so a reader comparing the two does
+// not have to translate. It is a mirror rather than an import because
+// identity.profiles.v1 must not take a package dependency on
+// marketplace.orders.v1 for seven scalars.
+//
+// There is no average, no score and no star here, and none may be added:
+// a number that can be minted for free crowds out the signals that cannot.
+//
+// NB: a NEIGHBOUR of SellerTrustBadge, never to be merged into it.
+// SellerTrustBadge carries verification presence flags; this carries order
+// counters. They answer different questions and are fetched on different
+// paths — the badge is batched for up to 50 sellers on a catalogue page,
+// this is per-profile.
+message SellerOrderStats {
+  int32 completed_orders_count    = 1;
+  int32 buyer_cancellation_count  = 2;
+  int32 seller_cancellation_count = 3;
+  // ABSENT — not zero — whenever stats_display_eligible is false.
+  // This is the ONE place the mirror diverges from the orders message,
+  // where the field is a plain int32. orders-service returns the number
+  // regardless and only documents that callers must not show it;
+  // profile-service applies that rule here by leaving the field unset, so
+  // no client can opt out of it and no client has to be trusted to obey a
+  // comment. One refusal in fifty reads differently from one in one, and
+  // only the pair is informative.
+  optional int32 unresolved_count = 4;
+  // Copied verbatim from orders-service. profile-service does NOT
+  // recompute it: two components deciding the same question two ways is
+  // how they eventually disagree.
+  bool  stats_display_eligible    = 5;
+  // Distinct BUYERS across this seller's COMPLETED orders only — the
+  // denominator that makes completed_orders_count mean something. Twenty
+  // orders from one buyer and twenty from twenty buyers are the same number
+  // without it, and the first shape is what two colluding accounts produce
+  // for free. Counted over completed orders only, matching
+  // completed_orders_count, so the pair reads as a fraction; counting
+  // distinct buyers across ALL statuses would let a colluder inflate the
+  // denominator with cancellations and invert the signal.
+  int32 distinct_counterparty_count = 6;
+  // Requests this seller DECLINED, kept separate from
+  // seller_cancellation_count on purpose: declining a request costs a buyer
+  // a few days, abandoning a CONFIRMED order in May costs them the season.
+  // Folding the two together would make a cautious seller who declines what
+  // he cannot fill look identical to one who strands buyers after
+  // committing.
+  int32 rejected_count              = 7;
 }
 
 // Presence wrappers for the multi-value dictionary fields on UpdateProfile.
