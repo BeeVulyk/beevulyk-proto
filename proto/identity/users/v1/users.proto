@@ -51,6 +51,43 @@ service UsersService {
   // Single-id by design. A batch variant is a clean additive follow-up if
   // marketplace listings ever need to resolve N sellers at once.
   rpc GetUserContacts(GetUserContactsRequest) returns (GetUserContactsResponse);
+
+  // Surface: client
+  // Authenticated. Issues a fresh 6-digit email-verification code for the
+  // CALLER'S OWN address and delivers it by calling
+  // notifications.delivery.v1.SendTransactionalEmail synchronously.
+  //
+  // There is deliberately NO user_id and NO email field on the request. The
+  // caller travels only in `x-authenticated-user-id` metadata and the subject
+  // address is read from the user row, which is the rule
+  // notifications.delivery.v1.RegisterDeviceToken and marketplace.orders.v1
+  // already follow: a body field whose only permitted value is the metadata
+  // value cannot carry information, only a bug. It is also the point of §3.6 —
+  // there is no reason to verify someone else's address and every reason not
+  // to allow it.
+  //
+  // A resend SUPERSEDES the previous code rather than re-sending it (§3.4),
+  // and a delivery failure FAILS this RPC (§4.4).
+  rpc RequestEmailVerification(RequestEmailVerificationRequest) returns (RequestEmailVerificationResponse);
+
+  // Surface: client
+  // Authenticated. Consumes the code and sets users.email_verified = TRUE.
+  // Revokes NOTHING — confirming an email is not a security event (§3.3).
+  // Sets phone_verified NEVER (§3.2).
+  rpc ConfirmEmailVerification(ConfirmEmailVerificationRequest) returns (ConfirmEmailVerificationResponse);
+
+  // Surface: client — PUBLIC, no authentication. The user cannot log in.
+  // ALWAYS reports success for a syntactically valid address, whether or not
+  // an account exists (§3.5). An unknown address stores nothing and sends
+  // nothing. Success is an EMPTY message on purpose: any field at all would
+  // be an existence oracle.
+  rpc RequestPasswordReset(RequestPasswordResetRequest) returns (RequestPasswordResetResponse);
+
+  // Surface: client — PUBLIC, no authentication. The token IS the
+  // authentication. On success: sets the new password hash AND revokes every
+  // refresh token the user holds (§3.3), including the session on the device
+  // performing the reset.
+  rpc ConfirmPasswordReset(ConfirmPasswordResetRequest) returns (ConfirmPasswordResetResponse);
 }
 
 message PingRequest {}
@@ -234,4 +271,152 @@ enum GetUserContactsErrorCode {
 message GetUserContactsError {
   GetUserContactsErrorCode code    = 1;
   string                   message = 2;
+}
+
+// ---- RequestEmailVerification -----------------------------------------------
+
+// Empty on purpose — see the RPC comment. The caller is identified by
+// `x-authenticated-user-id` metadata; the subject address comes from the user
+// row, never from the wire.
+message RequestEmailVerificationRequest {}
+
+message RequestEmailVerificationResponse {
+  oneof result {
+    RequestEmailVerificationSuccess success = 1;
+    RequestEmailVerificationError   error   = 2;
+  }
+}
+
+message RequestEmailVerificationSuccess {
+  int64 expires_at_ms = 1;  // When the code stops working; lets the client show a countdown.
+}
+
+enum RequestEmailVerificationErrorCode {
+  REQUEST_EMAIL_VERIFICATION_ERROR_CODE_UNSPECIFIED      = 0;
+  // The caller's address is already verified. Safe to disclose: the caller IS
+  // the owner, so this leaks nothing they do not already know.
+  REQUEST_EMAIL_VERIFICATION_ERROR_CODE_ALREADY_VERIFIED = 1;
+  // Hand-off to notification-service failed. The code was NOT sent and the
+  // caller must be told so (§4.4) — never a success with a logged warning.
+  REQUEST_EMAIL_VERIFICATION_ERROR_CODE_DELIVERY_FAILED  = 2;
+  // Also covers missing `x-authenticated-user-id` metadata, which means the
+  // GATEWAY is broken, not the end user — same rule as
+  // notification-service's adapters/grpc/metadata.rs.
+  REQUEST_EMAIL_VERIFICATION_ERROR_CODE_INTERNAL         = 3;
+}
+
+message RequestEmailVerificationError {
+  RequestEmailVerificationErrorCode code    = 1;
+  string                            message = 2;
+}
+
+// ---- ConfirmEmailVerification -----------------------------------------------
+
+message ConfirmEmailVerificationRequest {
+  string code = 1;  // required; exactly 6 ASCII digits, leading zeros significant.
+}
+
+message ConfirmEmailVerificationResponse {
+  oneof result {
+    ConfirmEmailVerificationSuccess success = 1;
+    ConfirmEmailVerificationError   error   = 2;
+  }
+}
+
+message ConfirmEmailVerificationSuccess {
+  bool  email_verified  = 1;  // Always true on success.
+  int64 verified_at_ms  = 2;
+}
+
+enum ConfirmEmailVerificationErrorCode {
+  CONFIRM_EMAIL_VERIFICATION_ERROR_CODE_UNSPECIFIED  = 0;
+  // THE ONE GENERIC FAILURE (§3.4). Wrong code, expired code, exhausted code
+  // and no-code-at-all ALL return this, with an identical message and an
+  // identical `fields` payload. Distinguishing them tells an attacker that
+  // the shape of the code they were guessing was right. Do NOT add
+  // EXPIRED / EXHAUSTED / NOT_FOUND variants to this enum, ever.
+  CONFIRM_EMAIL_VERIFICATION_ERROR_CODE_INVALID_CODE = 1;
+  CONFIRM_EMAIL_VERIFICATION_ERROR_CODE_INTERNAL     = 2;
+}
+
+message ConfirmEmailVerificationError {
+  ConfirmEmailVerificationErrorCode code    = 1;
+  string                            message = 2;
+  repeated FieldError               fields  = 3;  // Always exactly [{field:"code", reason:"invalid"}] for INVALID_CODE.
+}
+
+// ---- RequestPasswordReset ---------------------------------------------------
+
+message RequestPasswordResetRequest {
+  string email = 1;  // required; normalized to lowercase server-side.
+}
+
+message RequestPasswordResetResponse {
+  oneof result {
+    RequestPasswordResetSuccess success = 1;
+    RequestPasswordResetError   error   = 2;
+  }
+}
+
+// Empty on purpose and permanently so. Returning an expiry, a masked address,
+// a boolean, or anything else would differ between a known and an unknown
+// address and hand a competitor an account-existence oracle (§3.5). The
+// platform's addresses are beekeepers and the community is small.
+message RequestPasswordResetSuccess {}
+
+enum RequestPasswordResetErrorCode {
+  REQUEST_PASSWORD_RESET_ERROR_CODE_UNSPECIFIED     = 0;
+  // The address is not a syntactically valid email. This is a property of the
+  // string the caller sent, not of the account store, so it discloses nothing.
+  REQUEST_PASSWORD_RESET_ERROR_CODE_INVALID_INPUT   = 1;
+  // Hand-off to notification-service failed for an address that DOES exist
+  // (§4.4). Known and accepted: during a mail outage this distinguishes a
+  // known address from an unknown one. §4.4 outranks that leak — never tell a
+  // waiting user a code was sent when it was not.
+  REQUEST_PASSWORD_RESET_ERROR_CODE_DELIVERY_FAILED = 2;
+  REQUEST_PASSWORD_RESET_ERROR_CODE_INTERNAL        = 3;
+}
+
+message RequestPasswordResetError {
+  RequestPasswordResetErrorCode code    = 1;
+  string                        message = 2;
+  repeated FieldError           fields  = 3;  // Populated when code = INVALID_INPUT.
+}
+
+// ---- ConfirmPasswordReset ---------------------------------------------------
+
+message ConfirmPasswordResetRequest {
+  string token        = 1;  // required; the opaque secret from the reset email.
+  string new_password = 2;  // required; plaintext over TLS from gateway.
+}
+
+message ConfirmPasswordResetResponse {
+  oneof result {
+    ConfirmPasswordResetSuccess success = 1;
+    ConfirmPasswordResetError   error   = 2;
+  }
+}
+
+// Empty on purpose. No tokens are returned: every session was just revoked,
+// including the caller's, so the client must send the user to the login screen.
+message ConfirmPasswordResetSuccess {}
+
+enum ConfirmPasswordResetErrorCode {
+  CONFIRM_PASSWORD_RESET_ERROR_CODE_UNSPECIFIED   = 0;
+  // The new password failed validation — the SAME validation registration
+  // applies, with the SAME reason slugs (§4.2). A reset is not a back door to
+  // a weaker password. Checked BEFORE the token, and a failure here must NOT
+  // consume the token or increment its attempt counter.
+  CONFIRM_PASSWORD_RESET_ERROR_CODE_INVALID_INPUT = 1;
+  // THE ONE GENERIC FAILURE (§3.4), exactly as with the verification code:
+  // wrong, expired, exhausted, already-used and unknown all return this,
+  // identically. Do NOT add EXPIRED / NOT_FOUND variants.
+  CONFIRM_PASSWORD_RESET_ERROR_CODE_INVALID_TOKEN = 2;
+  CONFIRM_PASSWORD_RESET_ERROR_CODE_INTERNAL      = 3;
+}
+
+message ConfirmPasswordResetError {
+  ConfirmPasswordResetErrorCode code    = 1;
+  string                        message = 2;
+  repeated FieldError           fields  = 3;  // Populated when code = INVALID_INPUT (password rules).
 }
