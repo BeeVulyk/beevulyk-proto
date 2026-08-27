@@ -42,18 +42,52 @@ enum QuantityUnit {
 }
 
 // Delivery capability is a property of the PRODUCT, not a checkout choice
-// (spec §3.6). Nova Poshta prohibits sending insects outright and Ukrposhta
-// dropped bee packages in 2021, so bee packages have no compliant carrier.
+// (spec §3.6). Extending this dictionary is a pure append — never renumber.
 //
-// NOVA_POSHTA IS DELIBERATELY ABSENT AND MUST NOT BE ADDED for live goods.
-// Shipping bees by Nova Poshta breaks the carrier's own rules, voids any recourse
-// against them, and produces disputes the platform has decided not to arbitrate
-// (TASK-66/67). If it is ever added for inert goods, it must be gated by category.
+// NOVA_POSHTA IS ADMITTED FOR INERT GOODS ONLY (TASK-50/51/52).
+//   Legal for:    HONEY, BEE_PRODUCT, HIVE, EQUIPMENT, VET_PREPARATION, AGRI_GOODS.
+//   FORBIDDEN for: QUEEN_BEE, BEE_PACKAGE, BEE_COLONY.
+//
+// It was absent from this enum until 0.18.0, and the reason for that absence
+// still holds: the carrier prohibits sending insects outright, so offering it
+// for live goods would break the carrier's own rules, void any recourse against
+// them, and produce disputes the platform has decided not to arbitrate
+// (TASK-66/67). Its arrival here does NOT mean that prohibition was lifted.
+// What changed is only its scope. The rule had been applied to all nine
+// categories; six of them — the inert goods listed above — are things the
+// prohibition says nothing about, and for which Nova Poshta is the dominant
+// carrier in Ukraine.
+//
+// THIS ENUM CANNOT ENFORCE ANY OF THAT, and admitting a member to the
+// dictionary is NOT the same as making it legal for a category. The normative
+// per-category table is
+// `listings-service/src/domain/delivery.rs::allowed_delivery_methods`, which
+// matches on the CATEGORY and returns a list of methods — so a member added
+// here compiles cleanly and is legal for exactly zero categories until that
+// function is edited. No compiler error catches the omission. Making
+// NOVA_POSHTA actually offerable is a separate, deliberate act in that file
+// (together with the `listings_delivery_methods_check` CHECK constraint and
+// client-gateway's slug map). Do not read this value as universally offerable.
+//
+// Live goods are unchanged: Ukrposhta remains the only postal option for
+// queens — its May–October season is a comment in the file named above, not
+// logic enforced anywhere — and Ukrposhta dropped bee packages in 2021, so
+// packages and colonies still have no compliant carrier and offer only
+// SELF_PICKUP and COURIER_AGREED.
+//
+// ADDING A MEMBER HERE IS ADDITIVE; THE SAME ADDITION IN beevulyk-queue-contracts
+// IS NOT. proto3 enums are open, so a service still pinned to 0.16.0 or 0.17.0
+// keeps deserialising and simply sees an unrecognised number. The queue crate's
+// `marketplace::orders::DeliveryMethod` is a serde enum matched CLOSED: a
+// consumer on 0.7.0 that receives "nova_poshta" fails to deserialise and DLQs
+// the message, which is why a separate task bumps every consumer. Do not carry
+// this file's "additive" across to that one.
 enum DeliveryMethod {
   DELIVERY_METHOD_UNSPECIFIED    = 0;
   DELIVERY_METHOD_UKRPOSHTA      = 1;
   DELIVERY_METHOD_SELF_PICKUP    = 2;
   DELIVERY_METHOD_COURIER_AGREED = 3;  // private transport arranged between the parties
+  DELIVERY_METHOD_NOVA_POSHTA    = 4;  // inert goods only — see the per-category rule above
 }
 
 // A queen is not stock, it is a booking (spec §1). PRE_ORDER pairs with
