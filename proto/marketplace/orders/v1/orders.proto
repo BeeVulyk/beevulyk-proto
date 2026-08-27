@@ -180,6 +180,18 @@ service OrdersService {
   //   another service asking about a third party, not a user asserting who they are.
   rpc GetSellerOrderStats(GetSellerOrderStatsRequest) returns (GetSellerOrderStatsResponse);
 
+  // Surface: internal — NO gateway route exposes this, in this release or any
+  //   other. profile-service calls it to decide whether a user may write a review
+  //   of an order, and about which seller. It is the ONLY thing profile-service
+  //   is told about an order: it never learns the order's status, and this
+  //   response deliberately carries no OrderStatus field so that it cannot.
+  //   The rules in the state machine stay in the state machine.
+  //
+  //   Like GetSellerOrderStats it carries party ids in its BODY, which is not a
+  //   violation of the no-party-id rule above: the caller is another service
+  //   asking about a third party, not a user asserting who they are.
+  rpc GetOrderReviewEligibility(GetOrderReviewEligibilityRequest) returns (GetOrderReviewEligibilityResponse);
+
   // Surface: internal — required by platform convention.
   rpc Ping(PingRequest) returns (PingResponse);
 }
@@ -1191,6 +1203,95 @@ enum GetSellerOrderStatsErrorCode {
 
 message GetSellerOrderStatsError {
   GetSellerOrderStatsErrorCode          code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- GetOrderReviewEligibility ----------------------------------------------
+//
+// INTERNAL. Like GetSellerOrderStats it is a query, not a transition, so it has
+// neither FORBIDDEN_TRANSITION nor INVALID_STATUS_TRANSITION. It answers exactly
+// one question for profile-service — "may this user write a review of this order,
+// and about which seller?" — and discloses nothing else about the order.
+//
+// WHICH ORDERS ARE REVIEWABLE, and why the obvious rule is wrong.
+//
+// COMPLETED, CLOSED_REPLACED and CLOSED_UNRESOLVED are reviewable. The tempting
+// rule — "only COMPLETED orders may be reviewed" — would make every transaction
+// that went wrong silent, so the surface would not be neutral, it would be
+// systematically flattering: every satisfied buyer would have a voice and the
+// buyer whose queens never arrived would have none.
+//
+// The dividing line is NOT "goods changed hands", and that phrasing must not be
+// reproduced here. FROM_SHIPPED contains an edge to CLOSED_UNRESOLVED on
+// non-delivery, where nothing ever arrived — goods demonstrably did not change
+// hands, yet that is precisely the buyer whose account is most worth reading.
+// The rule that actually holds against this file's own transition table is:
+// THE ORDER CONCLUDED AFTER THE SELLER WAS COMMITTED TO DISPATCH IT.
+// CANCELLED, REJECTED and EXPIRED are unreachable from SHIPPED; they end a
+// negotiation, not an experience of the goods.
+//
+// The list itself lives in orders-service as an exhaustive match over every
+// OrderStatus, not as a derived dispatch predicate, so a thirteenth status
+// cannot be added without someone stating whether it is reviewable.
+
+// Why a caller may not review an order. UNSPECIFIED means `eligible` is true —
+// there is no reason, because there was no refusal.
+//
+// These four are DISTINCT FACTS and the caller collapses them, not this service.
+// profile-service maps NOT_A_PARTY and ORDER_NOT_FOUND to one indistinguishable
+// answer on its own client surface; that is its decision to make, and making it
+// here would deny the caller information it needs to answer correctly.
+enum ReviewIneligibilityReason {
+  REVIEW_INELIGIBILITY_REASON_UNSPECIFIED           = 0;
+  // No order with that id.
+  REVIEW_INELIGIBILITY_REASON_ORDER_NOT_FOUND       = 1;
+  // The order exists; the caller is neither its buyer nor its seller.
+  REVIEW_INELIGIBILITY_REASON_NOT_A_PARTY           = 2;
+  // The caller is the SELLER. Sellers do not review buyers and do not review
+  // themselves; `orders_no_self_dealing` already makes the latter impossible.
+  REVIEW_INELIGIBILITY_REASON_NOT_THE_BUYER         = 3;
+  // The caller is the buyer, but the order never reached a reviewable state.
+  // Which state it is in is NOT disclosed — that is the point of this enum.
+  REVIEW_INELIGIBILITY_REASON_STATUS_NOT_REVIEWABLE = 4;
+}
+
+message GetOrderReviewEligibilityRequest {
+  string order_id = 1;
+  string user_id  = 2;  // the prospective reviewer
+}
+
+message GetOrderReviewEligibilityResponse {
+  oneof result {
+    GetOrderReviewEligibilitySuccess success = 1;
+    GetOrderReviewEligibilityError   error   = 2;
+  }
+}
+
+// A REFUSAL IS A SUCCESS, NOT AN ERROR. `eligible = false` means the question was
+// answered. The `error` arm means it could not be answered. That split is
+// load-bearing: profile-service turns a denial into a typed client refusal and an
+// error into a propagated failure, and folding them would make an orders-service
+// outage read to the user as "your order is not eligible for review".
+message GetOrderReviewEligibilitySuccess {
+  bool                      eligible      = 1;
+  // UNSPECIFIED when `eligible`; always set otherwise.
+  ReviewIneligibilityReason denial_reason = 2;
+  // Set ONLY when `eligible` is true. Withheld otherwise so that a refusal
+  // cannot be used to learn who sells on an order the caller has no part in.
+  optional string           seller_id     = 3;
+}
+
+enum GetOrderReviewEligibilityErrorCode {
+  GET_ORDER_REVIEW_ELIGIBILITY_ERROR_CODE_UNSPECIFIED   = 0;
+  GET_ORDER_REVIEW_ELIGIBILITY_ERROR_CODE_INVALID_INPUT = 1;
+  GET_ORDER_REVIEW_ELIGIBILITY_ERROR_CODE_INTERNAL      = 2;
+}
+
+// `fields` is present because this RPC can return INVALID_INPUT (a malformed
+// ULID), which is the house rule for when that field appears.
+message GetOrderReviewEligibilityError {
+  GetOrderReviewEligibilityErrorCode    code    = 1;
   string                                message = 2;
   repeated identity.users.v1.FieldError fields  = 3;
 }

@@ -63,6 +63,23 @@ service ProfilesService {
   //   `x-authenticated-user-id` metadata.
   rpc GetSellerTrustBadges(GetSellerTrustBadgesRequest) returns (GetSellerTrustBadgesResponse);
 
+  // Surface: client — the BUYER of a dispatched order writes one review of its seller.
+  //   Eligibility is not decided here: profile-service asks orders-service, which owns
+  //   the state machine.
+  rpc CreateOrderReview(CreateOrderReviewRequest) returns (CreateOrderReviewResponse);
+
+  // Surface: client — the author retracts their own review during the withdrawal
+  //   window, BEFORE it has ever been visible to anyone. Keyed by order_id, not
+  //   review_id, so an author who no longer holds the create response can still
+  //   reach it: they always know their own order.
+  //
+  //   This is NOT deletion of a published review, which does not exist and must
+  //   never be added. Once visible, a review is permanent.
+  rpc WithdrawOrderReview(WithdrawOrderReviewRequest) returns (WithdrawOrderReviewResponse);
+
+  // Surface: client — the reviewed seller answers, once.
+  rpc ReplyToOrderReview(ReplyToOrderReviewRequest) returns (ReplyToOrderReviewResponse);
+
   // Surface: internal — the ONLY write path that moves verification_status to
   //   VERIFIED or REJECTED, and therefore the only one that can emit
   //   ProfileVerificationChanged. Until this RPC existed those transitions
@@ -316,6 +333,51 @@ message SellerOrderStats {
   int32 rejected_count              = 7;
 }
 
+// ---- Order reviews ----------------------------------------------------------
+
+// One buyer's account of one order, about its seller.
+//
+// THERE IS NO SCORE HERE, AND NONE MAY BE ADDED — no star, no thumb, no numeric
+// rating, and no COUNT of reviews either. A count is a score wearing a different
+// hat: "47 reviews" ranks sellers by volume just as an average ranks them by
+// sentiment, and both are minted for free by anyone willing to transact with
+// themselves. Text is expensive to fake convincingly and a reader can tell. That
+// asymmetry is the entire reason this surface exists, and the same rule already
+// stated on SellerOrderStats applies here without exception.
+//
+// The reply is NESTED, never a sibling list. A reply is meaningless without the
+// review it answers, and nesting makes "the reply is never returned alone" a
+// property of the schema rather than a rule the mappers are trusted to keep.
+//
+// ORDERS THAT ENDED BADLY PRODUCE REVIEWS. Eligibility is decided by
+// orders-service, and it admits COMPLETED, CLOSED_REPLACED and CLOSED_UNRESOLVED
+// alike — the rule is that the order concluded after the seller was committed to
+// dispatch, not that goods changed hands. A surface that carried only the happy
+// endings would be flattering rather than neutral, and the buyer whose parcel
+// never arrived is the reader this exists for. profile-service never learns which
+// of those states an order is in; it only learns that a review is permitted.
+message OrderReview {
+  string                    review_id       = 1;
+  string                    order_id        = 2;
+  string                    seller_id       = 3;  // the subject
+  string                    buyer_id        = 4;  // the author
+  string                    body            = 5;
+  int64                     published_at_ms = 6;
+  optional OrderReviewReply reply           = 7;
+}
+
+// The reviewed seller's single answer. Displayed with its review, never above it.
+// One reply, not a thread: a conversation invites escalation and the reader is
+// not a jury. The seller gets the last word by construction — that asymmetry is
+// deliberate compensation for the buyer having spoken first.
+message OrderReviewReply {
+  string reply_id        = 1;
+  string review_id       = 2;
+  string seller_id       = 3;
+  string body            = 4;
+  int64  published_at_ms = 5;
+}
+
 // Presence wrappers for the multi-value dictionary fields on UpdateProfile.
 // proto3 `repeated` has no presence, so a bare repeated field cannot
 // distinguish "leave this list alone" from "replace it with the empty list".
@@ -329,14 +391,30 @@ message HoneyTypeList { repeated beekeeping.reference.v1.HoneyType values = 1; }
 
 // ---- GetOwnProfile ----------------------------------------------------------
 
-message GetOwnProfileRequest { string user_id = 1; }
+message GetOwnProfileRequest {
+  string user_id = 1;
+  // Opaque cursor from a previous response's `next_reviews_cursor`. Absent = first page.
+  optional string reviews_cursor    = 2;
+  // Default 20, hard max 50. A value above the cap is CLAMPED, not rejected —
+  // matching SearchListings.
+  optional int32  reviews_page_size = 3;
+}
 message GetOwnProfileResponse {
   oneof result {
     GetOwnProfileSuccess success = 1;
     GetOwnProfileError   error   = 2;
   }
 }
-message GetOwnProfileSuccess { Profile profile = 1; }
+// Reviews ride this ENVELOPE, not `Profile` — see the note on
+// GetPublicProfileSuccess, including why there is no `total_count` here either.
+message GetOwnProfileSuccess {
+  Profile profile = 1;
+  // Reviews OF this seller, newest first. Always present; `[]` when there are none.
+  repeated OrderReview reviews = 2;
+  // Absent on the last page. There is deliberately NO total — see
+  // GetPublicProfileSuccess.
+  optional string next_reviews_cursor = 3;
+}
 enum GetOwnProfileErrorCode {
   GET_OWN_PROFILE_ERROR_CODE_UNSPECIFIED = 0;
   GET_OWN_PROFILE_ERROR_CODE_NOT_FOUND   = 1;
@@ -466,14 +544,37 @@ message UploadAvatarError { UploadAvatarErrorCode code = 1; string message = 2; 
 
 // ---- GetPublicProfile -------------------------------------------------------
 
-message GetPublicProfileRequest { string user_id = 1; }
+message GetPublicProfileRequest {
+  string user_id = 1;
+  // Opaque cursor from a previous response's `next_reviews_cursor`. Absent = first page.
+  optional string reviews_cursor    = 2;
+  // Default 20, hard max 50. A value above the cap is CLAMPED, not rejected —
+  // matching SearchListings.
+  optional int32  reviews_page_size = 3;
+}
 message GetPublicProfileResponse {
   oneof result {
     GetPublicProfileSuccess success = 1;
     GetPublicProfileError   error   = 2;
   }
 }
-message GetPublicProfileSuccess { PublicProfile profile = 1; }
+// The review list rides this ENVELOPE and NOT `PublicProfile` / `Profile`, which
+// gain no field: a cursor has to sit beside the list it pages, and this repo
+// already puts caller-relative and request-relative facts on the envelope
+// (marketplace.orders.v1.GetOrderSuccess.contacts_released) rather than on the
+// entity. `Profile` field 28 and `PublicProfile` field 26 stay free.
+message GetPublicProfileSuccess {
+  PublicProfile profile = 1;
+  // Reviews OF this seller, newest first. Always present; `[]` when there are none.
+  repeated OrderReview reviews = 2;
+  // Absent on the last page.
+  //
+  // NOTE THE ABSENCE OF `total_count`, which SearchListingsSuccess does carry.
+  // It is left out deliberately and must not be added: a total here IS the review
+  // count, which is the aggregate this whole feature refuses to publish. Pagination
+  // that needs a total is pagination that has invented a score.
+  optional string next_reviews_cursor = 3;
+}
 enum GetPublicProfileErrorCode {
   GET_PUBLIC_PROFILE_ERROR_CODE_UNSPECIFIED = 0;
   GET_PUBLIC_PROFILE_ERROR_CODE_NOT_FOUND   = 1;
@@ -722,3 +823,120 @@ message SetVerificationStatusError {
   string                                message = 2;
   repeated identity.users.v1.FieldError fields  = 3;
 }
+
+// ---- CreateOrderReview ------------------------------------------------------
+// Client. NO PARTY ID IN THE BODY: the author's identity arrives as
+// `x-authenticated-user-id` metadata, as on every client RPC in this package.
+// An order id is carried as a plain string — this package must NOT import
+// marketplace.orders.v1, and nothing from it is needed.
+
+message CreateOrderReviewRequest {
+  string order_id = 1;
+  string body     = 2;
+}
+message CreateOrderReviewResponse {
+  oneof result {
+    CreateOrderReviewSuccess success = 1;
+    CreateOrderReviewError   error   = 2;
+  }
+}
+message CreateOrderReviewSuccess {
+  OrderReview review = 1;
+  // Until when the author may withdraw it, and — the same instant — when it first
+  // becomes visible to anyone else. On the ENVELOPE and not on OrderReview because
+  // it is a fact about this caller's remaining options, not about the review.
+  int64       withdrawable_until_ms = 2;
+}
+enum CreateOrderReviewErrorCode {
+  CREATE_ORDER_REVIEW_ERROR_CODE_UNSPECIFIED          = 0;
+  CREATE_ORDER_REVIEW_ERROR_CODE_INVALID_INPUT        = 1;
+  // No such order, or the caller is not a party to it. One code, deliberately.
+  CREATE_ORDER_REVIEW_ERROR_CODE_ORDER_NOT_FOUND      = 2;
+  // The caller is a party, but the seller. They can already see this order, so
+  // pretending it does not exist would be a lie to someone looking at it.
+  CREATE_ORDER_REVIEW_ERROR_CODE_NOT_THE_BUYER        = 3;
+  // The order never reached a reviewable state. The state itself is not disclosed.
+  CREATE_ORDER_REVIEW_ERROR_CODE_ORDER_NOT_REVIEWABLE = 4;
+  // A live review already exists for this order.
+  CREATE_ORDER_REVIEW_ERROR_CODE_ALREADY_REVIEWED     = 5;
+  CREATE_ORDER_REVIEW_ERROR_CODE_INTERNAL             = 6;
+}
+message CreateOrderReviewError {
+  CreateOrderReviewErrorCode            code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- WithdrawOrderReview ----------------------------------------------------
+// Client. Keyed by order_id, not review_id — see the RPC comment. This is the
+// ONLY removal path in the package and it closes when the review becomes
+// visible; there is no edit path at any point in the lifecycle.
+
+message WithdrawOrderReviewRequest { string order_id = 1; }
+message WithdrawOrderReviewResponse {
+  oneof result {
+    WithdrawOrderReviewSuccess success = 1;
+    WithdrawOrderReviewError   error   = 2;
+  }
+}
+message WithdrawOrderReviewSuccess {}
+enum WithdrawOrderReviewErrorCode {
+  WITHDRAW_ORDER_REVIEW_ERROR_CODE_UNSPECIFIED   = 0;
+  WITHDRAW_ORDER_REVIEW_ERROR_CODE_INVALID_INPUT = 1;
+  // No live review for that order authored by this caller.
+  WITHDRAW_ORDER_REVIEW_ERROR_CODE_NOT_FOUND     = 2;
+  // It exists and is theirs, but the window has closed and it is now public.
+  WITHDRAW_ORDER_REVIEW_ERROR_CODE_WINDOW_CLOSED = 3;
+  WITHDRAW_ORDER_REVIEW_ERROR_CODE_INTERNAL      = 4;
+}
+message WithdrawOrderReviewError {
+  WithdrawOrderReviewErrorCode          code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- ReplyToOrderReview -----------------------------------------------------
+// Client. The reviewed seller answers once. The reply comes back NESTED inside
+// its review, never on its own.
+
+message ReplyToOrderReviewRequest {
+  string review_id = 1;
+  string body      = 2;
+}
+message ReplyToOrderReviewResponse {
+  oneof result {
+    ReplyToOrderReviewSuccess success = 1;
+    ReplyToOrderReviewError   error   = 2;
+  }
+}
+message ReplyToOrderReviewSuccess { OrderReview review = 1; }  // the review WITH its new reply
+enum ReplyToOrderReviewErrorCode {
+  REPLY_TO_ORDER_REVIEW_ERROR_CODE_UNSPECIFIED     = 0;
+  REPLY_TO_ORDER_REVIEW_ERROR_CODE_INVALID_INPUT   = 1;
+  // No visible review with that id.
+  REPLY_TO_ORDER_REVIEW_ERROR_CODE_NOT_FOUND       = 2;
+  // The review is visible and the caller is not its seller. NOT collapsed into
+  // NOT_FOUND: a published review is PUBLIC, so hiding its existence from someone
+  // who can read it on the profile page would be a lie about something they can see.
+  REPLY_TO_ORDER_REVIEW_ERROR_CODE_NOT_THE_SELLER  = 3;
+  REPLY_TO_ORDER_REVIEW_ERROR_CODE_ALREADY_REPLIED = 4;
+  REPLY_TO_ORDER_REVIEW_ERROR_CODE_INTERNAL        = 5;
+}
+message ReplyToOrderReviewError {
+  ReplyToOrderReviewErrorCode           code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- NO MODERATION SURFACE OF ANY KIND, AND NO SELLER-REVIEWS-BUYER SURFACE --
+//
+// No report RPC, no takedown RPC, no moderation status field, no admin RPC, and
+// no comment or string implying the platform reads, reviews or endorses what is
+// written. TASK-66 settled it: an interface that invites a complaint and then
+// does nothing leaves the user worse off than no mechanism at all, and there is
+// no admin-gateway to route one to. Do not add one "for later".
+//
+// No `BuyerReview`, no `reviewee_role`, no symmetry. Nobody browses buyers, so a
+// review of one would have no reader; what it would actually do is deter honest
+// buyer reviews, because a critical one would invite a retaliatory one that
+// follows the buyer around.
