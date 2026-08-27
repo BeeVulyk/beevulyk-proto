@@ -53,3 +53,11 @@ pub mod marketplace {
         }
     }
 }
+
+pub mod notifications {
+    pub mod delivery {
+        pub mod v1 {
+            tonic::include_proto!("notifications.delivery.v1");
+        }
+    }
+}

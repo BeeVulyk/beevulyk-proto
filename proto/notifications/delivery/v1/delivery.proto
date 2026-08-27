@@ -1,0 +1,194 @@
+syntax = "proto3";
+
+package notifications.delivery.v1;
+
+import "identity/users/v1/users.proto";  // reuse FieldError — never redefine
+
+// NotificationService owns delivery, device tokens and the send log.
+//
+// Two delivery mechanisms live behind this package and only ONE of them is
+// here. Transactional messages — a verification code the user is staring at a
+// screen waiting for — go through `SendTransactionalEmail` and fail LOUDLY.
+// Ambient messages — an order was confirmed — arrive over Kafka, are delivered
+// best-effort by push, and have no RPC at all. See spec §3.2. The difference in
+// delivery guarantee is the entire point; do not add an RPC for an ambient
+// notification.
+service NotificationService {
+  // Surface: internal
+  // Called server-to-server by `users-service` for the email-verification and
+  // password-reset codes of #36/#37. NOT exposed as a gateway route: it sends
+  // mail to an arbitrary address and is reachable from an unauthenticated
+  // sign-up path, so the only caller may ever be another service.
+  rpc SendTransactionalEmail(SendTransactionalEmailRequest) returns (SendTransactionalEmailResponse);
+
+  // Surface: client
+  // Registers or REPLACES the push token for one (caller, device) pair.
+  // The caller comes from `x-authenticated-user-id` metadata only.
+  rpc RegisterDeviceToken(RegisterDeviceTokenRequest) returns (RegisterDeviceTokenResponse);
+
+  // Surface: client
+  // Unbinds one device from the calling user. Called at logout. Idempotent —
+  // returns Success even when the device was unknown, exactly like
+  // identity.users.v1.Logout, so a retried logout cannot fail and an unknown
+  // device id is not an existence oracle.
+  rpc UnregisterDeviceToken(UnregisterDeviceTokenRequest) returns (UnregisterDeviceTokenResponse);
+
+  // Surface: internal
+  // Required by platform convention.
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message PingRequest {}
+
+message PingResponse {
+  int64 server_time_ms = 1;
+}
+
+// ---- SendTransactionalEmail -------------------------------------------------
+
+// The closed set of transactional messages this service can render.
+//
+// A template KEY, never a body. `SendTransactionalEmailRequest` deliberately
+// carries no HTML and no subject: a caller that can supply a body can supply
+// anything, and this RPC is reachable from a service handling unauthenticated
+// sign-up. Adding a `body` field re-opens that hole — do not.
+enum EmailTemplateKey {
+  EMAIL_TEMPLATE_KEY_UNSPECIFIED        = 0;
+  EMAIL_TEMPLATE_KEY_EMAIL_VERIFICATION = 1;  // #36
+  EMAIL_TEMPLATE_KEY_PASSWORD_RESET     = 2;  // #37
+}
+
+// The small typed set of values a template may interpolate.
+//
+// A fixed message rather than a `map<string,string>`: a map is free-form input
+// wearing a type, and every key it could carry is a key nobody validated.
+message TransactionalEmailSubstitutions {
+  string code = 1;  // required; the verification / reset code.
+
+  // When the code stops working. Absent means the rendered message omits the
+  // expiry line entirely rather than printing a zero.
+  optional int64 expires_at_ms = 2;
+}
+
+message SendTransactionalEmailRequest {
+  // The RECIPIENT ADDRESS, not a user id — see spec §4.3. The caller is already
+  // generating a code FOR this address. Passing it explicitly keeps this
+  // service free of any lookup client, keeps it unable to enumerate users, and
+  // makes the call work for an address not yet attached to a confirmed account,
+  // which is exactly #36's case. Do not "improve" this to a user_id.
+  string recipient_email = 1;
+
+  EmailTemplateKey template_key = 2;
+
+  TransactionalEmailSubstitutions substitutions = 3;
+}
+
+message SendTransactionalEmailResponse {
+  oneof result {
+    SendTransactionalEmailSuccess success = 1;
+    SendTransactionalEmailError   error   = 2;
+  }
+}
+
+message SendTransactionalEmailSuccess {
+  string send_id = 1;  // ULID of the send_log row. NOT a handle to the body.
+
+  // The provider's message id where one exists. Absent for providers that
+  // return none.
+  optional string provider_ref = 2;
+
+  int64 sent_at_ms = 3;
+}
+
+enum SendTransactionalEmailErrorCode {
+  SEND_TRANSACTIONAL_EMAIL_ERROR_CODE_UNSPECIFIED     = 0;
+  SEND_TRANSACTIONAL_EMAIL_ERROR_CODE_INVALID_INPUT   = 1;  // bad address, UNSPECIFIED template, empty code.
+  // Hand-off to the mail provider failed. This is an ERROR and not a success
+  // with a logged warning, because the caller is waiting and must be able to
+  // tell the user the code was not sent (spec §3.2, §4.3).
+  SEND_TRANSACTIONAL_EMAIL_ERROR_CODE_DELIVERY_FAILED = 2;
+  SEND_TRANSACTIONAL_EMAIL_ERROR_CODE_INTERNAL        = 3;
+}
+
+message SendTransactionalEmailError {
+  SendTransactionalEmailErrorCode      code    = 1;
+  string                              message = 2;  // Human-readable; optional. NEVER echoes the code that was being sent.
+  repeated identity.users.v1.FieldError fields = 3;  // Populated when code = INVALID_INPUT.
+}
+
+// ---- Device tokens ----------------------------------------------------------
+
+enum DevicePlatform {
+  DEVICE_PLATFORM_UNSPECIFIED = 0;
+  DEVICE_PLATFORM_IOS         = 1;
+  DEVICE_PLATFORM_ANDROID     = 2;
+}
+
+message RegisterDeviceTokenRequest {
+  // App-supplied, stable per install. Together with the authenticated user it
+  // is the natural key: re-registering the same device REPLACES the token
+  // rather than accumulating a row (spec §3.6).
+  string device_id = 1;
+
+  string token = 2;  // required; the provider's push token.
+
+  DevicePlatform platform = 3;  // required; UNSPECIFIED is INVALID_INPUT.
+
+  // There is deliberately NO user_id field. The caller's identity travels only
+  // in `x-authenticated-user-id` metadata, the same rule
+  // marketplace.orders.v1 follows. A body field whose only permitted value is
+  // the metadata value cannot carry information, only a bug.
+}
+
+message RegisterDeviceTokenResponse {
+  oneof result {
+    RegisterDeviceTokenSuccess success = 1;
+    RegisterDeviceTokenError   error   = 2;
+  }
+}
+
+message RegisterDeviceTokenSuccess {
+  string         device_token_id  = 1;  // ULID of the row. Stable across a replace.
+  string         device_id        = 2;
+  DevicePlatform platform         = 3;
+  int64          registered_at_ms = 4;
+}
+
+enum RegisterDeviceTokenErrorCode {
+  REGISTER_DEVICE_TOKEN_ERROR_CODE_UNSPECIFIED   = 0;
+  REGISTER_DEVICE_TOKEN_ERROR_CODE_INVALID_INPUT = 1;
+  REGISTER_DEVICE_TOKEN_ERROR_CODE_INTERNAL      = 2;
+}
+
+message RegisterDeviceTokenError {
+  RegisterDeviceTokenErrorCode          code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+message UnregisterDeviceTokenRequest {
+  string device_id = 1;  // No user_id — metadata only, as above.
+}
+
+message UnregisterDeviceTokenResponse {
+  oneof result {
+    UnregisterDeviceTokenSuccess success = 1;
+    UnregisterDeviceTokenError   error   = 2;
+  }
+}
+
+// Empty on purpose. There is no "was it there?" flag: reporting whether a
+// device id existed would turn logout into an existence oracle, and the caller
+// has no use for the distinction.
+message UnregisterDeviceTokenSuccess {}
+
+enum UnregisterDeviceTokenErrorCode {
+  UNREGISTER_DEVICE_TOKEN_ERROR_CODE_UNSPECIFIED   = 0;
+  UNREGISTER_DEVICE_TOKEN_ERROR_CODE_INVALID_INPUT = 1;  // device_id empty.
+  UNREGISTER_DEVICE_TOKEN_ERROR_CODE_INTERNAL      = 2;
+}
+
+message UnregisterDeviceTokenError {
+  UnregisterDeviceTokenErrorCode code    = 1;
+  string                         message = 2;
+}
