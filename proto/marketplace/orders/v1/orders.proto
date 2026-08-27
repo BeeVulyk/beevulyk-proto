@@ -284,10 +284,25 @@ enum FulfilmentClass {
 // in this release or in TASK-48 reads this field. It exists so that it is present,
 // populated and understood by the time it becomes load-bearing.
 //
-// COD_NOVA_POSHTA IS DELIBERATELY ABSENT AND MUST NOT BE ADDED. Nova Poshta
-// prohibits sending insects, so offering cash-on-delivery through that carrier would
-// route the wedge category (queens) into a carrier that forbids it — the same reason
-// NOVA_POSHTA is absent from marketplace.reference.v1.DeliveryMethod (TASK-67).
+// COD_NOVA_POSHTA IS DELIBERATELY ABSENT AND MUST NOT BE ADDED — but as of
+// 0.18.0 the reason needs restating, because the sentence that used to carry it
+// has become false.
+//
+// It used to read: "the same reason NOVA_POSHTA is absent from
+// marketplace.reference.v1.DeliveryMethod". That carrier is no longer absent
+// there. It was admitted in 0.18.0 for INERT categories only — honey, bee
+// products, hives, equipment, vet preparations, agri goods — because the
+// carrier's prohibition is on INSECTS, and applying it to honey was an
+// over-reach that left honey sellers with no mainstream carrier.
+//
+// The reason for keeping COD_NOVA_POSHTA out survives that change intact, and
+// it is narrower than the old wording implied: cash-on-delivery exists here for
+// the WEDGE category, queens, which is exactly the category that carrier still
+// forbids. A COD rail through a carrier that will not carry the goods is not a
+// payment method — it is a dead end that looks like one at checkout.
+//
+// If Nova Poshta COD is ever wanted for inert goods, that is a NEW argument to
+// be made on its own merits, not a revival of this one.
 enum PaymentMethod {
   PAYMENT_METHOD_UNSPECIFIED          = 0;
   PAYMENT_METHOD_CASH_ON_PICKUP       = 1;  // paid in person at handover; pairs with SELF_PICKUP
