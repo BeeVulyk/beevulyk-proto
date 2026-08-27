@@ -229,17 +229,32 @@ message SellerLabAnalysis {
 // Seller trust signals rendered beside a public listing (spec §3.10). Fetched from
 // profile-service.GetPublicProfile at read time and NEVER stored in listings_service.
 //
-// `has_vet_passport_number` is a PRESENCE FLAG, not the number: the spec scopes the
-// listing surface to "passport-number presence". The number itself stays on the
-// profile page.
+// NEITHER document NUMBER appears on this message. Both the veterinary passport
+// and the apiary registration are PRESENCE FLAGS only — `has_vet_passport_number`
+// and `has_apiary_registration_number` — because this message is rendered on a
+// PUBLIC, UNCREDENTIALLED page (`GET /listings/{listing_id}`), and the numbers
+// belong nowhere a stranger can enumerate them. They are self-asserted free text
+// with no format validation and no proof of ownership, so publishing one lends
+// the appearance of official verification without the substance.
+// `listings-browse-search-spec` §4.4 and `public-profile-view-spec` §3.4 both
+// require presence, not values. The numbers stay on the OWNER-facing profile.
 message SellerTrustBlock {
+  // Field 6 held `apiary_registration_number` as a VALUE on a message rendered
+  // on the PUBLIC listing detail page. That contradicted the presence-only rule
+  // stated above it, the identical rule on `SellerTrustBadge` below, and
+  // `listings-browse-search-spec` §4.4. It sat directly beside the presence flag
+  // at 5 — one field got the treatment and its sibling did not. Removed, not
+  // deprecated; the name is reserved so it cannot come back under the same key.
+  reserved 6;
+  reserved "apiary_registration_number";
+
   string                     seller_id                  = 1;
   optional string            display_name               = 2;
   optional string            avatar_url                 = 3;
   SellerVerificationStatus   verification_status        = 4;
   bool                       has_vet_passport_number    = 5;
-  optional string            apiary_registration_number = 6;
   repeated SellerLabAnalysis lab_analyses               = 7;  // analysed_at DESC
+  bool                       has_apiary_registration_number = 8;  // presence, NEVER the value
 }
 
 // Trust signals rendered beside ONE row of a search result page (spec §4.4).

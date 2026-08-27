@@ -206,6 +206,20 @@ message PublicProfile {
   // see the note on Profile.
   reserved 3;
 
+  // Fields 15 and 16 held `vet_passport_number` and `apiary_registration_number`
+  // as VALUES. They were removed, not deprecated. This message is returned on a
+  // PUBLIC, UNAUTHENTICATED surface (client-gateway `GET /profile/{user_id}`),
+  // and a public surface that carries document identifiers is a register.
+  // `public-profile-view-spec` §3.4 is unconditional about this and explicitly
+  // overrides `profile-extended-spec` §3.5, which had argued the passport
+  // number was a buyer-facing signal. The presence flags at 26 and 27 carry the
+  // trust signal; the numbers themselves carry nothing a buyer can verify,
+  // because they are self-asserted free text with no format validation and no
+  // proof of ownership. The names are reserved so the fields cannot be
+  // reintroduced under the same key.
+  reserved 15, 16;
+  reserved "vet_passport_number", "apiary_registration_number";
+
   string                user_id         = 1;
   optional string       display_name    = 2;
   optional string       location_city   = 4;
@@ -220,12 +234,10 @@ message PublicProfile {
   repeated beekeeping.reference.v1.HoneyType  honey_types                = 12;
   optional beekeeping.reference.v1.ApiaryKind apiary_kind                = 13;
   bool                                        open_for_visits            = 14;
-  // The passport NUMBER is the buyer-facing signal, alongside the badge.
-  // The SCAN is deliberately absent from this message — no URL, and not even
-  // a has-document flag (verification_status already conveys that a document
-  // was submitted). See spec §3.5.
-  optional string                             vet_passport_number        = 15;
-  optional string                             apiary_registration_number = 16;
+  // The document NUMBERS that used to sit here at 15 and 16 are gone; see the
+  // reservation at the top of this message. The SCAN remains deliberately
+  // absent too — no URL, and not even a has-document flag, because
+  // verification_status already conveys that a document was submitted.
   VerificationStatus                          verification_status        = 17;
   optional string                             verified_by                = 18;
   optional int64                              verified_at_ms             = 19;
@@ -246,6 +258,12 @@ message PublicProfile {
   // completed orders: zero is a statement about the seller, absent is a
   // statement about the platform. Never render zeros on failure.
   optional SellerOrderStats                   seller_order_stats         = 25;
+  // Presence, NEVER the value — the same rule `SellerTrustBadge` below follows.
+  // These exist so the public profile page can render the same verification
+  // badge the listing card renders, and so listings-service has a presence
+  // source now that the values are gone.
+  bool                                        has_vet_passport_number        = 26;
+  bool                                        has_apiary_registration_number = 27;
 }
 
 // One image in a seller's apiary gallery. Maximum 10 per user.
