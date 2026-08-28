@@ -134,6 +134,13 @@ enum RegisterUserErrorCode {
   REGISTER_USER_ERROR_CODE_EMAIL_TAKEN   = 2;  // Unique-constraint violation on email.
   REGISTER_USER_ERROR_CODE_PHONE_TAKEN   = 3;  // Unique-constraint violation on phone.
   REGISTER_USER_ERROR_CODE_INTERNAL      = 4;
+  // Too many attempts for this identifier. Carries NO retry-after: a precise
+  // countdown tells an attacker when the window opened and buys an honest
+  // client nothing. The counter advances BEFORE the account lookup, so this
+  // answer is identical for an address that exists and one that does not —
+  // otherwise the limiter would answer the existence question that TASK-81
+  // closed on the timing channel.
+  REGISTER_USER_ERROR_CODE_RATE_LIMITED  = 5;
 }
 
 message FieldError {
@@ -175,6 +182,13 @@ enum LoginUserErrorCode {
   LOGIN_USER_ERROR_CODE_INVALID_INPUT       = 1;  // Malformed email format.
   LOGIN_USER_ERROR_CODE_INVALID_CREDENTIALS = 2;  // Wrong email OR wrong password — do NOT distinguish.
   LOGIN_USER_ERROR_CODE_INTERNAL            = 3;
+  // Too many attempts for this identifier. The counter advances BEFORE the
+  // user lookup, so an unknown address is refused exactly like a known one —
+  // a limiter that only counted real accounts would re-open the enumeration
+  // oracle TASK-81 closed, and more cheaply than the timing channel did.
+  // A successful login clears the counter, so knowing your own password
+  // cannot be denied to you by someone who does not.
+  LOGIN_USER_ERROR_CODE_RATE_LIMITED        = 4;
 }
 
 message LoginUserError {
@@ -303,6 +317,12 @@ enum RequestEmailVerificationErrorCode {
   // GATEWAY is broken, not the end user — same rule as
   // notification-service's adapters/grpc/metadata.rs.
   REQUEST_EMAIL_VERIFICATION_ERROR_CODE_INTERNAL         = 3;
+  // Too many code requests. Keyed on the AUTHENTICATED CALLER, not on an
+  // address: this RPC takes user_id from metadata and can only mail the
+  // caller's own inbox, so it is not a harassment vector and must not be
+  // described as one. The limit exists so a stolen session or a client stuck
+  // retrying cannot spend the platform's mail sender without bound.
+  REQUEST_EMAIL_VERIFICATION_ERROR_CODE_RATE_LIMITED     = 4;
 }
 
 message RequestEmailVerificationError {
@@ -375,6 +395,12 @@ enum RequestPasswordResetErrorCode {
   // waiting user a code was sent when it was not.
   REQUEST_PASSWORD_RESET_ERROR_CODE_DELIVERY_FAILED = 2;
   REQUEST_PASSWORD_RESET_ERROR_CODE_INTERNAL        = 3;
+  // Too many reset requests for this address. This is the TIGHTEST budget on
+  // the service: the RPC is unauthenticated and takes an arbitrary email, so
+  // repeating it fills a STRANGER'S inbox and needs no guessing at all. The
+  // refusal is identical for an address with an account and one without,
+  // preserving the 202-either-way property this RPC already has.
+  REQUEST_PASSWORD_RESET_ERROR_CODE_RATE_LIMITED    = 4;
 }
 
 message RequestPasswordResetError {
