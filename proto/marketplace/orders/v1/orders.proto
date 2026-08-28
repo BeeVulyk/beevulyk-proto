@@ -162,6 +162,26 @@ service OrdersService {
   //   The parcel never arrived, so there is nothing to observe and no remedy to run.
   rpc ReportNonDelivery(ReportNonDeliveryRequest) returns (ReportNonDeliveryResponse);
 
+  // Surface: client — SELLER only. Records that the seller received payment.
+  //
+  // NOT A LIFECYCLE TRANSITION. `payment_status` is a SECOND, INDEPENDENT
+  // AXIS: an order can be delivered and unpaid, or paid and never
+  // dispatched. This RPC does not read `OrderStatus`, does not change it,
+  // and cannot fail because of it — see the reserved number in the error
+  // enum below.
+  //
+  // UNPAID -> PAID, one way. Idempotent: marking a paid order paid again
+  // succeeds, returns the order unchanged, and does NOT move `paid_at_ms`.
+  //
+  // There is deliberately no inverse and no buyer-side confirmation. The
+  // platform never held the money, so there is nothing to reverse; and only
+  // the seller knows the money landed — for POSTAL_COD it arrives from
+  // Ukrposhta days after delivery, so even the buyer's knowledge is stale.
+  //
+  // A buyer calling this is a party but the wrong one: FORBIDDEN_TRANSITION,
+  // never NOT_FOUND. They can already read the order through GetOrder.
+  rpc MarkOrderPaid(MarkOrderPaidRequest) returns (MarkOrderPaidResponse);
+
   // Surface: client — BUYER only. Called BEFORE RequestReplacement.
   //   Returns an opaque storage key that the buyer then passes in
   //   `ReplacementClaimInput.evidence_keys`. Evidence goes to the PRIVATE storage root
@@ -280,9 +300,16 @@ enum FulfilmentClass {
   FULFILMENT_CLASS_GOODS       = 2;  // everything else -> 0-day window
 }
 
-// Snapshotted and INFORMATIONAL. The platform holds no money (TASK-70) and nothing
-// in this release or in TASK-48 reads this field. It exists so that it is present,
-// populated and understood by the time it becomes load-bearing.
+// `payment_method` is SNAPSHOTTED and INFORMATIONAL: it records what the parties
+// agreed to, and there is no integration behind ANY of its values. Nothing reads
+// it to make a decision. It exists so that it is present, populated and understood
+// by the time it becomes load-bearing.
+//
+// `payment_status` is NO LONGER INERT — do not read the paragraph above as covering
+// it. As of TASK-49 it is WRITTEN, by `MarkOrderPaid`, by the SELLER, out of band
+// from the money itself, which the platform still never touches (TASK-70). It is a
+// seller's assertion of receipt on an axis independent of `OrderStatus`, not
+// something the platform observed and not a lifecycle state.
 //
 // COD_NOVA_POSHTA IS DELIBERATELY ABSENT AND MUST NOT BE ADDED — but as of
 // 0.18.0 the reason needs restating, because the sentence that used to carry it
@@ -314,8 +341,8 @@ enum PaymentMethod {
 
 enum PaymentStatus {
   PAYMENT_STATUS_UNSPECIFIED = 0;
-  PAYMENT_STATUS_UNPAID      = 1;  // the only value this release ever writes
-  PAYMENT_STATUS_PAID        = 2;
+  PAYMENT_STATUS_UNPAID      = 1;  // the value every order starts at
+  PAYMENT_STATUS_PAID        = 2;  // set only by MarkOrderPaid, and only by the seller
 }
 
 // Who performed a transition. Mirrors the actor_type CHECK on
@@ -473,6 +500,20 @@ message Order {
   optional string  replacement_for_order_id = 28;  // set on a child order only
   int32            replacement_generation   = 29;  // 0 for an original order, 1 for a replacement child
   optional int64   next_deadline_at_ms      = 30;  // the single pending deadline, if any
+
+  // ---- Payment surface (a SECOND axis; NOT part of the lifecycle above) ------
+  //
+  // When the SELLER recorded that they were paid. Absent until they do.
+  //
+  // NOT a payment-provider timestamp and not an instant the platform
+  // observed — the platform never touches the money (TASK-70). It is the
+  // moment a seller asserted receipt, which is the answer to "when was I
+  // paid": the question a seller actually asks.
+  //
+  // Paired with `payment_status` by a table CHECK in orders-service: PAID
+  // implies this is set, UNPAID implies it is absent. Never read one
+  // without the other.
+  optional int64   paid_at_ms               = 31;
 }
 
 // One claim line. The observation window is per ORDER (one delivery is one clock) but a
@@ -1116,6 +1157,47 @@ enum ReportNonDeliveryErrorCode {
 
 message ReportNonDeliveryError {
   ReportNonDeliveryErrorCode            code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// ---- MarkOrderPaid ----------------------------------------------------------
+
+message MarkOrderPaidRequest { string order_id = 1; }
+
+message MarkOrderPaidResponse {
+  oneof result {
+    MarkOrderPaidSuccess success = 1;
+    MarkOrderPaidError   error   = 2;
+  }
+}
+
+// The returned order has payment_status PAID and paid_at_ms set. Its
+// `status` is whatever it already was — unchanged, and deliberately so.
+message MarkOrderPaidSuccess { Order order = 1; }
+
+enum MarkOrderPaidErrorCode {
+  MARK_ORDER_PAID_ERROR_CODE_UNSPECIFIED          = 0;
+  // Unknown id, malformed id, or a caller who is not a party. One answer for
+  // all three, so the RPC never becomes an existence oracle for order ids.
+  MARK_ORDER_PAID_ERROR_CODE_NOT_FOUND            = 1;
+  // A party, but the BUYER. Only the seller can record their own receipt.
+  // Distinct from NOT_FOUND on purpose: the buyer can already read this
+  // order, so hiding the action would be a lie to somebody who sees the truth.
+  MARK_ORDER_PAID_ERROR_CODE_FORBIDDEN_TRANSITION = 2;
+  // 3 is INVALID_STATUS_TRANSITION on all eleven lifecycle RPCs and is
+  // RESERVED HERE ON PURPOSE. Payment is orthogonal to the lifecycle. Gating
+  // this on a status would make an unpaid order un-completable — precisely
+  // the escrow behaviour the platform cannot legally provide (only a bank may
+  // hold escrow in Ukraine). Reserving the number makes that unrepresentable
+  // rather than merely discouraged.
+  reserved 3;
+  MARK_ORDER_PAID_ERROR_CODE_INVALID_INPUT        = 4;
+  MARK_ORDER_PAID_ERROR_CODE_INTERNAL             = 5;
+}
+
+message MarkOrderPaidError {
+  MarkOrderPaidErrorCode                code    = 1;
   string                                message = 2;
   repeated identity.users.v1.FieldError fields  = 3;
 }
