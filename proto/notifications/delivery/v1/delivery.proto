@@ -33,6 +33,21 @@ service NotificationService {
   // device id is not an existence oracle.
   rpc UnregisterDeviceToken(UnregisterDeviceTokenRequest) returns (UnregisterDeviceTokenResponse);
 
+  // The two RPCs below do NOT breach the service-level rule above. That rule
+  // forbids an RPC that SENDS an ambient notification. These read and write a
+  // user's SETTINGS; they deliver nothing. Ambient delivery still has no RPC.
+
+  // Surface: client
+  // Returns the EFFECTIVE preference for every suppressible template, including
+  // templates with no stored row. Caller comes from `x-authenticated-user-id`
+  // metadata only.
+  rpc GetNotificationPreferences(GetNotificationPreferencesRequest) returns (GetNotificationPreferencesResponse);
+
+  // Surface: client
+  // Replaces the caller's entire preference set. Caller comes from
+  // `x-authenticated-user-id` metadata only.
+  rpc UpdateNotificationPreferences(UpdateNotificationPreferencesRequest) returns (UpdateNotificationPreferencesResponse);
+
   // Surface: internal
   // Required by platform convention.
   rpc Ping(PingRequest) returns (PingResponse);
@@ -191,4 +206,118 @@ enum UnregisterDeviceTokenErrorCode {
 message UnregisterDeviceTokenError {
   UnregisterDeviceTokenErrorCode code    = 1;
   string                         message = 2;
+}
+
+// ---- Notification preferences ----------------------------------------------
+
+// The CLOSED set of notifications a user may switch off.
+//
+// Membership rule: a notification may be suppressed only if ignoring it costs
+// the recipient nothing. TEN of the eleven templates shipped by #75 fail that
+// test.
+//
+// Eight of those ten name an action or a deadline — a new order to confirm, a
+// replacement request to answer, an expiry that already cost the recipient
+// something. Turning off "you have a new order" is not a preference; it is a
+// seller silently ending their own trade, and they would never connect the
+// silence to a setting they changed in March. (Only FIVE of the eleven demand
+// an explicit action. "Requires an action" was never the test — the broader
+// rule above is, and it is what this enum encodes. See the correction in
+// notification-preferences-spec.md §3.2; do not read the smaller number as
+// room to widen the set.)
+//
+// The other two of the ten are the transactional email codes. Those are never
+// routed through preferences AT ALL — not "default on", never asked.
+// `SendTransactionalEmail` is synchronous and a human is watching a screen for
+// the code. A user who somehow suppressed their own reset code would be locked
+// out permanently: there is no support desk, and the recovery path is the
+// message they suppressed.
+//
+// A closed enum rather than a string is what makes a non-suppressible template
+// impossible to express on the wire at all.
+//
+// This set has TWO members and is expected to stay small. Widening it so the
+// surface feels bigger is the failure mode this comment exists to guard
+// against — DO NOT add a member for that reason. The smallness is the finding,
+// not a gap.
+enum SuppressibleTemplateKey {
+  SUPPRESSIBLE_TEMPLATE_KEY_UNSPECIFIED             = 0;
+  // The owner's profile passed review. The badge is on their profile whether
+  // or not they are told.
+  SUPPRESSIBLE_TEMPLATE_KEY_PROFILE_VERIFIED_OWNER  = 1;
+  // A review of the seller became visible. The review is public on their
+  // profile regardless, and the single reply they get carries no deadline.
+  // NEW — this template did not exist among the eleven shipped by #75; it is
+  // the membership rule applied to a new template, not a reclassification of
+  // an old one.
+  SUPPRESSIBLE_TEMPLATE_KEY_REVIEW_PUBLISHED_SELLER = 2;
+}
+
+message NotificationPreference {
+  SuppressibleTemplateKey template_key = 1;
+  // TRUE means the user has switched this notification OFF. Absence of a
+  // stored row means FALSE — everything is on by default.
+  bool suppressed = 2;
+}
+
+// No fields. The caller is the authenticated user, from metadata.
+message GetNotificationPreferencesRequest {}
+
+message GetNotificationPreferencesResponse {
+  oneof result {
+    GetNotificationPreferencesSuccess success = 1;
+    GetNotificationPreferencesError   error   = 2;
+  }
+}
+
+message GetNotificationPreferencesSuccess {
+  // EFFECTIVE state: one entry per member of SuppressibleTemplateKey (never
+  // UNSPECIFIED), whether or not a row is stored. A client must not have to
+  // know that absence means on.
+  repeated NotificationPreference preferences = 1;
+}
+
+enum GetNotificationPreferencesErrorCode {
+  GET_NOTIFICATION_PREFERENCES_ERROR_CODE_UNSPECIFIED = 0;
+  GET_NOTIFICATION_PREFERENCES_ERROR_CODE_INTERNAL    = 1;
+}
+
+message GetNotificationPreferencesError {
+  GetNotificationPreferencesErrorCode   code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
+}
+
+// FULL REPLACE, not a patch. Any suppressible template absent from
+// `preferences` is reset to suppressed=false (its stored row is deleted).
+// The client is expected to GET, flip one bit, and PUT the whole set back.
+message UpdateNotificationPreferencesRequest {
+  repeated NotificationPreference preferences = 1;
+
+  // No user_id here either — metadata only, as with the device-token RPCs.
+}
+
+message UpdateNotificationPreferencesResponse {
+  oneof result {
+    UpdateNotificationPreferencesSuccess success = 1;
+    UpdateNotificationPreferencesError   error   = 2;
+  }
+}
+
+message UpdateNotificationPreferencesSuccess {
+  // The full effective state AFTER the write, same shape as the read.
+  repeated NotificationPreference preferences = 1;
+}
+
+enum UpdateNotificationPreferencesErrorCode {
+  UPDATE_NOTIFICATION_PREFERENCES_ERROR_CODE_UNSPECIFIED   = 0;
+  // A template_key of UNSPECIFIED, or the same key listed twice.
+  UPDATE_NOTIFICATION_PREFERENCES_ERROR_CODE_INVALID_INPUT = 1;
+  UPDATE_NOTIFICATION_PREFERENCES_ERROR_CODE_INTERNAL      = 2;
+}
+
+message UpdateNotificationPreferencesError {
+  UpdateNotificationPreferencesErrorCode code    = 1;
+  string                                 message = 2;
+  repeated identity.users.v1.FieldError  fields  = 3;
 }
