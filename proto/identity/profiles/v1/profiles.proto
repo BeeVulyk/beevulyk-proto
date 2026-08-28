@@ -89,6 +89,22 @@ service ProfilesService {
   //   verification flag defeats the entire feature.
   rpc SetVerificationStatus(SetVerificationStatusRequest) returns (SetVerificationStatusResponse);
 
+  // Surface: client — the caller's OWN seasonal work calendar (TASK-76).
+  //   Identity from metadata; there is no user_id on the request, because a
+  //   calendar personalised by somebody else's oblast is not a feature.
+  //
+  //   SHIPS WITH AN EMPTY DICTIONARY, deliberately. The content is agronomic
+  //   expertise and TASK-76 blocks itself until a named author signs the
+  //   dates: telling a beekeeper to treat for varroa in the wrong week costs
+  //   colonies. The storage enforces it — `authored_by` is NOT NULL — so this
+  //   RPC returning an empty list is the honest state, not a bug.
+  rpc GetApiaryCalendar(GetApiaryCalendarRequest) returns (GetApiaryCalendarResponse);
+
+  // Surface: client — "зроблено" for one work item in one season. Without it
+  //   reminders become noise and get switched off, which is the card's own
+  //   reasoning for including it in the first cut.
+  rpc MarkApiaryWorkDone(MarkApiaryWorkDoneRequest) returns (MarkApiaryWorkDoneResponse);
+
   // Surface: internal — required by platform convention.
   rpc Ping(PingRequest) returns (PingResponse);
 }
@@ -958,3 +974,107 @@ message ReplyToOrderReviewError {
 // review of one would have no reader; what it would actually do is deter honest
 // buyer reviews, because a critical one would invite a retaliatory one that
 // follows the buyer around.
+
+// ---- Apiary calendar (TASK-76) ----------------------------------------------
+//
+// The MECHANISM only. Every table behind this ships empty; see the RPC comments
+// and `migrations/20260828180000_apiary_calendar.sql`.
+
+// One seasonal job, already resolved against a year and the caller's oblast.
+//
+// The window arrives as two calendar DATES rather than a month/day pair,
+// because resolving "15 April plus the Kherson shift" is the service's job and
+// doing it twice — once here, once in an app — is how the two drift apart.
+message ApiaryWorkItem {
+  string code               = 1;
+  string title              = 2;
+  // Why it matters and what missing the window costs. A date alone is a nag.
+  string explanation        = 3;
+  // `YYYY-MM-DD`, inclusive, already shifted for the caller's oblast. A window
+  // may wrap the new year, in which case `window_end` is in the next year.
+  string window_start       = 4;
+  string window_end         = 5;
+  // Days before `window_start` at which a reminder is due. Carried so a client
+  // can show "in N days" without a second round trip; NOTHING SENDS IT YET —
+  // there is no reminder worker, and push reaches nobody while the app does
+  // not exist.
+  int32  reminder_lead_days = 6;
+  // Catalogue category this job sends the beekeeper to, e.g. `vet_preparation`.
+  // Empty where the job needs nothing bought — forcing every reminder to sell
+  // something is how a useful calendar turns into an ad.
+  string linked_category    = 7;
+  // Whether THIS caller has marked it done for this season.
+  bool   done               = 8;
+  // Who authored these dates and stands behind them. Never empty: the column
+  // is NOT NULL precisely so unsigned agronomic advice cannot be served.
+  string authored_by        = 9;
+}
+
+message GetApiaryCalendarRequest {
+  // `0` means the current season. Explicit years let a client show last year
+  // without a clock argument.
+  int32 season_year = 1;
+}
+
+message GetApiaryCalendarResponse {
+  oneof result {
+    GetApiaryCalendarSuccess success = 1;
+    GetApiaryCalendarError   error   = 2;
+  }
+}
+
+message GetApiaryCalendarSuccess {
+  // Ordered by resolved `window_start`. EMPTY until content is authored, and
+  // an empty list is a valid answer rather than an error.
+  repeated ApiaryWorkItem items       = 1;
+  int32                   season_year = 2;
+  // The oblast the windows were shifted for, as a slug; empty when the caller
+  // has not set one — in which case the base windows are returned unshifted
+  // and the client should say so rather than implying local accuracy.
+  string                  oblast      = 3;
+}
+
+enum GetApiaryCalendarErrorCode {
+  GET_APIARY_CALENDAR_ERROR_CODE_UNSPECIFIED   = 0;
+  GET_APIARY_CALENDAR_ERROR_CODE_INVALID_INPUT = 1;
+  GET_APIARY_CALENDAR_ERROR_CODE_INTERNAL      = 2;
+}
+
+message GetApiaryCalendarError {
+  GetApiaryCalendarErrorCode code    = 1;
+  string                     message = 2;
+  repeated identity.users.v1.FieldError fields = 3;
+}
+
+message MarkApiaryWorkDoneRequest {
+  string code        = 1;
+  // `0` means the current season.
+  int32  season_year = 2;
+}
+
+message MarkApiaryWorkDoneResponse {
+  oneof result {
+    MarkApiaryWorkDoneSuccess success = 1;
+    MarkApiaryWorkDoneError   error   = 2;
+  }
+}
+
+message MarkApiaryWorkDoneSuccess {
+  string code        = 1;
+  int32  season_year = 2;
+}
+
+enum MarkApiaryWorkDoneErrorCode {
+  MARK_APIARY_WORK_DONE_ERROR_CODE_UNSPECIFIED   = 0;
+  MARK_APIARY_WORK_DONE_ERROR_CODE_INVALID_INPUT = 1;
+  // No work item with this code. Not an existence oracle worth hiding: the
+  // dictionary is the same for every user and a client can read it all.
+  MARK_APIARY_WORK_DONE_ERROR_CODE_NOT_FOUND     = 2;
+  MARK_APIARY_WORK_DONE_ERROR_CODE_INTERNAL      = 3;
+}
+
+message MarkApiaryWorkDoneError {
+  MarkApiaryWorkDoneErrorCode code    = 1;
+  string                      message = 2;
+  repeated identity.users.v1.FieldError fields = 3;
+}
