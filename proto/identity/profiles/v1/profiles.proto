@@ -89,6 +89,18 @@ service ProfilesService {
   //   verification flag defeats the entire feature.
   rpc SetVerificationStatus(SetVerificationStatusRequest) returns (SetVerificationStatusResponse);
 
+  // Surface: internal — the moderation QUEUE, added for TASK-65.
+  //
+  //   Until this existed there was no way to READ what was waiting: documents
+  //   could be submitted and a status could be written, but the set of profiles
+  //   waiting on a decision was invisible to everything except a hand-written
+  //   SQL query. A queue nobody can list is a queue nobody works.
+  //
+  //   MUST NOT be exposed through client-gateway. It answers "who is waiting to
+  //   be judged" for every user at once, which is nobody's business but a
+  //   moderator's.
+  rpc ListPendingVerifications(ListPendingVerificationsRequest) returns (ListPendingVerificationsResponse);
+
   // Surface: client — the caller's OWN seasonal work calendar (TASK-76).
   //   Identity from metadata; there is no user_id on the request, because a
   //   calendar personalised by somebody else's oblast is not a feature.
@@ -1077,4 +1089,52 @@ message MarkApiaryWorkDoneError {
   MarkApiaryWorkDoneErrorCode code    = 1;
   string                      message = 2;
   repeated identity.users.v1.FieldError fields = 3;
+}
+
+// ---- ListPendingVerifications (TASK-65) -------------------------------------
+
+message ListPendingVerificationsRequest {
+  // 1..=200; `0` means the server default. Paged from the start rather than by
+  // cursor: the queue is worked down, so the interesting page is always the
+  // oldest, and a cursor over a set that shrinks as you work it is a bug
+  // waiting to happen.
+  int32 limit = 1;
+}
+
+message PendingVerification {
+  string user_id = 1;
+  // May be empty — a profile can submit documents before naming itself, and a
+  // moderator seeing a blank name is more honest than one seeing a placeholder.
+  string display_name = 2;
+  // When the profile last changed, which for a pending row is when it was
+  // submitted. `updated_at` is the only timestamp the row carries for this;
+  // there is deliberately no separate `submitted_at` column invented here.
+  int64 waiting_since_ms = 3;
+}
+
+message ListPendingVerificationsResponse {
+  oneof result {
+    ListPendingVerificationsSuccess success = 1;
+    ListPendingVerificationsError   error   = 2;
+  }
+}
+
+message ListPendingVerificationsSuccess {
+  // Oldest first: the queue is worked from the front.
+  repeated PendingVerification items = 1;
+  // Everything still pending, not just this page — the number a moderator
+  // actually wants, and the one the card's trigger is phrased in.
+  int32 total_pending = 2;
+}
+
+enum ListPendingVerificationsErrorCode {
+  LIST_PENDING_VERIFICATIONS_ERROR_CODE_UNSPECIFIED   = 0;
+  LIST_PENDING_VERIFICATIONS_ERROR_CODE_INVALID_INPUT = 1;
+  LIST_PENDING_VERIFICATIONS_ERROR_CODE_INTERNAL      = 2;
+}
+
+message ListPendingVerificationsError {
+  ListPendingVerificationsErrorCode     code    = 1;
+  string                                message = 2;
+  repeated identity.users.v1.FieldError fields  = 3;
 }
