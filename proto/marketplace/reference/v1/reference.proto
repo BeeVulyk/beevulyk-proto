@@ -70,10 +70,14 @@ enum QuantityUnit {
 // client-gateway's slug map). Do not read this value as universally offerable.
 //
 // Live goods are unchanged: Ukrposhta remains the only postal option for
-// queens — its May–October season is a comment in the file named above, not
-// logic enforced anywhere — and Ukrposhta dropped bee packages in 2021, so
-// packages and colonies still have no compliant carrier and offer only
-// SELF_PICKUP and COURIER_AGREED.
+// queens, and only seasonally — but May–October is the OUTER BOUND, not the
+// acceptance window. Ukrposhta also refuses bees when the temperature at
+// origin or destination exceeds +20 °C, which excludes most of July and
+// August. The platform enforces neither: the season, like the temperature
+// rule, is a comment in the file named above, not logic enforced anywhere —
+// the post office decides at the counter. And Ukrposhta dropped bee packages
+// in 2021, so packages and colonies still have no compliant carrier and offer
+// only SELF_PICKUP and COURIER_AGREED.
 //
 // ADDING A MEMBER HERE IS ADDITIVE; THE SAME ADDITION IN beevulyk-queue-contracts
 // IS NOT. proto3 enums are open, so a service still pinned to 0.16.0 or 0.17.0
