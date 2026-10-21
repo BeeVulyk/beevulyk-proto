@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+package logistics.directory.v1;
+
+import "marketplace/reference/v1/reference.proto";
+
+// The carrier branch directory — settlements, and the branches inside them.
+//
+// # Why this lives in shipping-service
+//
+// That service already holds the carrier credentials, the carrier HTTP
+// clients, and a failure vocabulary shaped by carriers rather than by us
+// (`carrier_error`, `no_such_parcel`, `adapter_disabled`). Putting lookups
+// anywhere else splits carrier integration across two services.
+//
+// It is, however, the service's FIRST inbound surface: until now it was purely
+// event-driven, consuming `OrderDispatched` and publishing
+// `ShipmentStatusChanged`. That cost is deliberate and was weighed — see
+// `docs/structured-delivery-address-spec.md` §8.
+//
+// # This is a CACHE, not a proxy
+//
+// Nothing here calls a carrier on the request path. The directory is refreshed
+// on a schedule into our own store and these RPCs read that store. A carrier
+// outage must degrade waybill creation later, never checkout now — a buyer
+// who cannot pick a branch cannot place an order at all.
+//
+// Nova Poshta's warehouse list runs to tens of thousands of rows and changes
+// slowly; querying it per keystroke would be both rude to them and slow for us.
+service DirectoryService {
+  // Settlements matching a query, for the chosen carrier.
+  //
+  // SETTLEMENT FIRST, BRANCH SECOND — both carriers model it that way and so
+  // does everyone asking the question. A flat search across every branch name
+  // answers «№12» forty times and makes the user disambiguate by scrolling.
+  rpc SearchSettlements(SearchSettlementsRequest) returns (SearchSettlementsResponse);
+
+  // Branches inside one settlement. Not searchable by name on purpose: a
+  // settlement rarely has enough branches to need it, and the list is what the
+  // buyer wants to see.
+  rpc ListBranches(ListBranchesRequest) returns (ListBranchesResponse);
+
+  // Resolve ids to current labels, and say whether they still exist.
+  //
+  // This is the checkout-time validation: a cache hours stale can offer a
+  // branch that has since closed, and an order must fail at checkout naming
+  // the branch rather than succeed and fail later when a waybill is cut.
+  rpc ResolveDestination(ResolveDestinationRequest) returns (ResolveDestinationResponse);
+
+  // Liveness/readiness for the SDK's probe, matching the other services.
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message Settlement {
+  string id    = 1;  // opaque carrier id
+  // Carries the oblast already — "Полтава, Полтавська обл." — because that is
+  // how the carrier stores it and how a buyer disambiguates two settlements
+  // with the same name. A separate structured region field was drafted and
+  // dropped: it would have been an enum with no members this service can fill,
+  // since the carrier's own record has no oblast code to map from.
+  string label = 2;
+}
+
+message Branch {
+  string id    = 1;  // opaque carrier id
+  string label = 2;  // "Відділення №40: вул. Соборності, 40"
+  // The carrier's own activity flag. A branch can exist in the directory and
+  // not accept parcels — temporarily closed, or opening next month. Surfaced
+  // rather than filtered, because "no branches found" and "all of this city's
+  // branches are shut today" are different answers.
+  bool accepts_parcels = 3;
+}
+
+message SearchSettlementsRequest {
+  marketplace.reference.v1.DeliveryMethod carrier = 1;
+  // Free text from the buyer. Matched case- and case-fold-insensitively;
+  // Ukrainian collation means «і»/«И» and «'» variants must not split results.
+  string query = 2;
+  int32  limit = 3;  // server caps it; 0 means the server default
+}
+
+message SearchSettlementsResponse {
+  repeated Settlement settlements = 1;
+  // True when the store has never been populated for this carrier. Distinct
+  // from an empty result: "we have no directory" and "this query matched
+  // nothing" must not look the same to the client.
+  bool directory_empty = 2;
+}
+
+message ListBranchesRequest {
+  marketplace.reference.v1.DeliveryMethod carrier       = 1;
+  string                                  settlement_id = 2;
+}
+
+message ListBranchesResponse {
+  repeated Branch branches = 1;
+  bool            settlement_unknown = 2;  // the id is not in our store
+}
+
+message ResolveDestinationRequest {
+  marketplace.reference.v1.CarrierDestination destination = 1;
+}
+
+message ResolveDestinationResponse {
+  oneof result {
+    // Both ids resolve and belong to the named carrier. Carries CURRENT
+    // labels, which the caller snapshots onto the order.
+    marketplace.reference.v1.CarrierDestination resolved = 1;
+    ResolveError                                error    = 2;
+  }
+}
+
+message ResolveError {
+  ResolveErrorCode code = 1;
+  // Names the offending branch or settlement so the buyer sees what went
+  // wrong, not a generic refusal.
+  string message = 2;
+}
+
+enum ResolveErrorCode {
+  RESOLVE_ERROR_CODE_UNSPECIFIED = 0;
+  // The settlement id is not in this carrier's directory.
+  RESOLVE_ERROR_CODE_SETTLEMENT_UNKNOWN = 1;
+  // The branch id is not in this carrier's directory, or has closed.
+  RESOLVE_ERROR_CODE_BRANCH_UNKNOWN = 2;
+  // The branch exists but sits in a different settlement than the one named.
+  RESOLVE_ERROR_CODE_BRANCH_SETTLEMENT_MISMATCH = 3;
+  // The ids belong to a different carrier than `destination.carrier`.
+  RESOLVE_ERROR_CODE_CARRIER_MISMATCH = 4;
+  // The directory has never been populated for this carrier; nothing can be
+  // resolved. Separate from BRANCH_UNKNOWN, which asserts the branch is not
+  // real — this one asserts only that we cannot tell.
+  RESOLVE_ERROR_CODE_DIRECTORY_EMPTY = 5;
+}
+
+message PingRequest {}
+
+message PingResponse {}

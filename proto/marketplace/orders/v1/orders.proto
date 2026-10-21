@@ -463,6 +463,11 @@ message Order {
   PaymentStatus                           payment_status          = 9;
   marketplace.reference.v1.DeliveryMethod delivery_method         = 10;
   optional string                         delivery_address        = 11;  // free text; not normalised in MVP
+  // SNAPSHOTTED, like payment_method above and for the same reason: branches
+  // close and get renumbered, and an order placed in March must still read the
+  // same in September. Resolving the ids live would also put a carrier call on
+  // this read path, where an outage would make orders unreadable.
+  optional marketplace.reference.v1.CarrierDestination destination  = 32;
   optional string                         readiness_date          = 12;  // YYYY-MM-DD, snapshotted from the listing.
                                                                          // A calendar date, NOT an instant — do not
                                                                          // "fix" this to int64 ms.
@@ -565,6 +570,13 @@ message CreateOrderRequest {
   // is the client's choice.
   optional string                         idempotency_key  = 6;
   optional string                         buyer_note       = 7;  // <= 500 chars
+  // Where the parcel goes, as carrier ids rather than a sentence.
+  //
+  // ABSENT IS LEGAL AND MEANINGFUL: SELF_PICKUP and COURIER_AGREED settle in
+  // person and have no branch, so they carry `delivery_address` free text
+  // instead. Present-with-the-wrong-carrier is NOT legal — a Nova Poshta Ref
+  // on an Ukrposhta order is rejected, never reinterpreted.
+  optional marketplace.reference.v1.CarrierDestination destination = 8;
 }
 
 message CreateOrderResponse {

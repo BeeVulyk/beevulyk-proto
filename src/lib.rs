@@ -36,6 +36,14 @@ pub mod identity {
     }
 }
 
+pub mod logistics {
+    pub mod directory {
+        pub mod v1 {
+            tonic::include_proto!("logistics.directory.v1");
+        }
+    }
+}
+
 pub mod marketplace {
     pub mod reference {
         pub mod v1 {

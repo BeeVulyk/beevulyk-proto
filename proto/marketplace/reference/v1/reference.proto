@@ -101,3 +101,37 @@ enum AvailabilityMode {
   AVAILABILITY_MODE_IN_STOCK    = 1;
   AVAILABILITY_MODE_PRE_ORDER   = 2;
 }
+
+// A destination at a carrier's branch, as chosen by the buyer at checkout.
+//
+// IDS AND LABELS TRAVEL TOGETHER, and both are required. The id is what a
+// waybill needs and the only unambiguous half; the label is what the buyer,
+// the seller and every support conversation actually use. Resolving an id
+// back to a label costs a live carrier call, which must never sit on the
+// order-detail read path — so the label is snapshotted here, exactly as
+// `PaymentMethod` is snapshotted onto the order.
+//
+// THE IDS ARE OPAQUE. Nova Poshta's are UUIDs, Ukrposhta's are its own index.
+// Do not parse a branch number out of one, do not sort by one, do not show
+// one to a human. They are keys.
+//
+// Absent for SELF_PICKUP and COURIER_AGREED, which settle in person and have
+// no branch. That absence is modelled by the field being optional on the
+// request, never by a sentinel value in here.
+message CarrierDestination {
+  // Which carrier's directory these ids belong to. Validated against the
+  // order's delivery_method — a Nova Poshta Ref on an Ukrposhta order is a
+  // rejected order, not a best-effort guess.
+  DeliveryMethod carrier = 1;
+
+  string settlement_id    = 2;  // opaque
+  string settlement_label = 3;  // "Полтава, Полтавська обл."
+  string branch_id        = 4;  // opaque
+  string branch_label     = 5;  // "Відділення №40: вул. Соборності, 40"
+
+  // Recipient as the carrier will record them. Separate from the buyer's
+  // profile on purpose: ordering a gift to someone else is ordinary, and the
+  // carrier needs whoever will actually collect the parcel.
+  string recipient_name  = 6;
+  string recipient_phone = 7;  // normalised to +380XXXXXXXXX at the boundary
+}
