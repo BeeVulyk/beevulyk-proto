@@ -623,6 +623,30 @@ enum CreateOrderErrorCode {
   // INTERNAL error at creation and NEVER a silent default of zero — a silent zero
   // sells a live queen with no guarantee, discovered fourteen days too late.
   CREATE_ORDER_ERROR_CODE_INTERNAL              = 7;
+  // We could not ASK THE BRANCH DIRECTORY. shipping-service was unreachable, timed out,
+  // or answered INTERNAL. NO ROW IS WRITTEN.
+  //
+  // The same non-degrading policy as LISTING_UNAVAILABLE above, for the same shape of
+  // reason. The instinct here is stronger, because accepting the destination as the
+  // client sent it *looks* harmless: the ids are right there in the request. It is not
+  // harmless. An unverified destination is the free-text situation this feature replaces,
+  // except it now looks machine-readable and nobody will re-check it — a stale branch id
+  // produces a waybill to the wrong place with full confidence, and the labels snapshotted
+  // alongside it would be the client's own, which may already disagree with the id they
+  // accompany.
+  //
+  // DISTINCT FROM INVALID_INPUT, and the client's retry behaviour is what the distinction
+  // is for: a branch the directory does not have is the buyer's to fix and must never be
+  // retried, while this one is ours and should be.
+  //
+  // ALSO raised when the directory answers DIRECTORY_EMPTY — and that mapping is the
+  // point of shipping-service distinguishing "empty" from "unknown" in the first place.
+  // An unpopulated directory is strictly a fact about us: our scheduled refresh has not
+  // run. Reporting it as INVALID_INPUT would tell a buyer their branch is not real
+  // because OUR cron was down, and would invite them to "fix" a field that is correct.
+  // Transport failure and an empty directory differ in cause and in nothing the client
+  // can act on, so they share one code: not your fault, try again later.
+  CREATE_ORDER_ERROR_CODE_DESTINATION_UNAVAILABLE = 8;
 }
 
 message CreateOrderError {
